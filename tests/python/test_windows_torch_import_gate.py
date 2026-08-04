@@ -75,6 +75,7 @@ def _probe_script(python_exe: str, timeout_ms: int = 30000) -> str:
 {probe}
 $r = Test-TorchImport -PythonExe '{python_exe}' -TimeoutMs {timeout_ms}
 Write-Output ("OK=" + $r.Ok)
+Write-Output ("TIMEDOUT=" + $r.TimedOut)
 Write-Output ("ERR=" + $r.Error)
 """
 
@@ -120,11 +121,41 @@ def test_silent_failure_still_reports_something_actionable(tmp_path):
 
 def test_a_wedged_import_is_killed_rather_than_hanging(tmp_path):
     # A hung `import torch` must not hang the installer. 1500ms so the test is quick;
-    # the installer uses the 30s default, matching Get-InstalledTorchTag.
+    # the installer's own default is 180s, matching install.sh.
     py = _fake_python(tmp_path, "python_hangs", "sleep 30")
     out = _pwsh(_probe_script(str(py), timeout_ms = 1500))
     assert "OK=False" in out
     assert "did not finish within 1s" in out
+    assert "TIMEDOUT=True" in out, "the caller cannot tell a wedged driver from a broken wheel"
+
+
+def test_a_real_import_failure_is_not_reported_as_a_timeout(tmp_path):
+    py = _fake_python(tmp_path, "python_broken", "echo 'ImportError: boom' >&2\nexit 1")
+    out = _pwsh(_probe_script(str(py)))
+    assert "OK=False" in out and "TIMEDOUT=False" in out
+
+
+def test_the_default_bound_matches_install_sh_and_is_overridable(tmp_path):
+    """A cold first load of torch's DLLs through an on-access scanner is legitimately
+    slow, so the bound has to be install.sh's 180s, not the 30s sized for a version
+    probe -- and the user needs the same escape hatch Linux has."""
+    probe = _extract(r"    function Test-TorchImport \{.*?\n    \}\n")
+    assert "$seconds = 180" in probe, "the Windows bound drifted from install.sh's 180s"
+    assert "UNSLOTH_TORCH_IMPORT_TIMEOUT" in probe, "Windows has no way to raise the bound"
+
+    # Executed, not just grepped: prove the env var actually reaches the wait.
+    py = _fake_python(tmp_path, "python_hangs_env", "sleep 30")
+    script = f"""
+$env:UNSLOTH_TORCH_IMPORT_TIMEOUT = '1'
+{probe}
+$r = Test-TorchImport -PythonExe '{py}'
+Write-Output ("OK=" + $r.Ok)
+Write-Output ("TIMEDOUT=" + $r.TimedOut)
+Write-Output ("ERR=" + $r.Error)
+"""
+    out = _pwsh(script)
+    assert "TIMEDOUT=True" in out
+    assert "did not finish within 1s" in out, out
 
 
 def test_missing_interpreter_is_a_failure_not_a_crash(tmp_path):
@@ -136,9 +167,17 @@ def test_missing_interpreter_is_a_failure_not_a_crash(tmp_path):
 # ── The gate logic, with the probe and the reinstall stubbed ──
 
 
-def _gate_script(*, skip_torch: bool, probe_results: list[bool]) -> str:
+def _gate_script(
+    *,
+    skip_torch: bool,
+    probe_results: list[bool],
+    probe_timeouts: list[bool] | None = None,
+) -> str:
     """Run the shipped gate with a scripted sequence of probe outcomes."""
     results = ", ".join("$true" if ok else "$false" for ok in probe_results)
+    if probe_timeouts is None:
+        probe_timeouts = [False] * len(probe_results)
+    timeouts = ", ".join("$true" if t else "$false" for t in probe_timeouts)
     # See _probe_script: kept out of the f-string for pre-3.12 compatibility.
     gate = _extract(
         r"    # ── Refuse to finish on a torch that installed but cannot be imported ──.*?\n    \}\n"
@@ -148,12 +187,14 @@ def _gate_script(*, skip_torch: bool, probe_results: list[bool]) -> str:
 $script:ProbeCalls = 0
 $script:RepairCalls = 0
 $script:ProbeResults = @({results})
+$script:ProbeTimeouts = @({timeouts})
 function Test-TorchImport {{
-    param([string]$PythonExe, [int]$TimeoutMs = 30000)
+    param([string]$PythonExe, [int]$TimeoutMs = 0)
     $i = $script:ProbeCalls
     $script:ProbeCalls++
     $ok = if ($i -lt $script:ProbeResults.Count) {{ $script:ProbeResults[$i] }} else {{ $false }}
-    return [pscustomobject]@{{ Ok = $ok; Error = 'ImportError: stubbed failure' }}
+    $to = if ($i -lt $script:ProbeTimeouts.Count) {{ $script:ProbeTimeouts[$i] }} else {{ $false }}
+    return [pscustomobject]@{{ Ok = $ok; TimedOut = $to; Error = 'ImportError: stubbed failure' }}
 }}
 # Write-Host, not Write-Output, and emitted as it happens. The gate wraps the
 # call in [void](...) which discards the whole success stream, and it returns on
@@ -220,6 +261,43 @@ def test_the_failure_message_tells_the_user_what_to_do():
     out = _run_gate(skip_torch = False, probe_results = [False, False])
     assert "UNSLOTH_PYTHON" in out, "must point at pinning a different interpreter"
     assert "--no-torch" in out, "must offer the GGUF-only escape"
+
+
+# A probe that never reported anything has not shown that torch is broken. A wedged
+# GPU driver blocks `import torch` outright (#7706, why Get-InstalledTorchTag reads
+# version.py off disk), and reinstalling cannot unwedge a driver. install.sh treats
+# 124 from timeout(1) as its own verdict and leaves the install in place; Windows
+# used to fold a timeout into "cannot be imported", so the same host that gets a
+# warning on Linux had its freshly built venv deleted and restored to the old one.
+
+
+def test_a_timeout_does_not_fail_the_install():
+    out = _run_gate(skip_torch = False, probe_results = [False], probe_timeouts = [True])
+    assert "EXIT_FAILURE" not in out, "a timeout must not fail an install that is probably fine"
+    assert "ROLLBACK_RESTORED" not in out, "a timeout must not roll a working venv back"
+    assert "REACHED_END" in out
+
+
+def test_a_timeout_attempts_no_repair():
+    out = _run_gate(skip_torch = False, probe_results = [False], probe_timeouts = [True])
+    assert "REPAIRS=0" in out, "reinstalling cannot unwedge a driver"
+    assert "PROBES=1" in out, "the timeout is the verdict; there is nothing to re-probe"
+
+
+def test_a_timeout_says_so_instead_of_blaming_the_wheel():
+    out = _run_gate(skip_torch = False, probe_results = [False], probe_timeouts = [True])
+    assert "did not finish importing" in out
+    assert "UNSLOTH_TORCH_IMPORT_TIMEOUT" in out, "the user needs the knob that raises the bound"
+    assert "cannot be imported" not in out, "a timeout is not evidence of a broken wheel"
+
+
+def test_a_slow_first_probe_that_then_succeeds_still_finishes():
+    """A timeout on probe 1 short-circuits, so a real ImportError still needs probe 2."""
+    out = _run_gate(
+        skip_torch = False, probe_results = [False, True], probe_timeouts = [False, False]
+    )
+    assert "PROBES=2" in out and "REPAIRS=1" in out
+    assert "EXIT_FAILURE" not in out
 
 
 # ── The reinstall helper picks the index this run already resolved ──

@@ -634,10 +634,10 @@ printf '%s | %s\n' "$final" "$(paste -sd';' "$RECREATE_LOG" 2>/dev/null)"
 rm -f "$RECREATE_LOG"
 RUNNER_EOF
 
-    _run_guard() {  # _USER_PYTHON OS _ARCH INIT_ARCH INIT_VER REBUILD_313_VERSION NO_313_9
+    _run_guard() {  # _USER_PYTHON OS _ARCH INIT_ARCH INIT_VER REBUILD_313_VERSION NO_313_9 SKIP_TORCH
         _vd=$(mktemp -d)
         env _USER_PYTHON="$1" OS="$2" _ARCH="$3" INIT_ARCH="$4" INIT_VER="$5" \
-            REBUILD_313_VERSION="$6" NO_313_9="$7" \
+            REBUILD_313_VERSION="$6" NO_313_9="$7" SKIP_TORCH="${8:-false}" \
             bash "$_RUNNER" "$_GUARD_FILE" "$_HELPERS_FILE" "$_vd/venv"
         rm -rf "$_vd"
     }
@@ -656,6 +656,16 @@ RUNNER_EOF
     assert_eq "3.12 fallback keeps the Apple Silicon triple when uv has no 3.13.9" \
         "arm64 3.12.7 | cpython->=3.13.9,<3.14-macos-aarch64-none;cpython-3.12-macos-aarch64-none" \
         "$(_run_guard '' macos arm64 arm64 3.13.8 '' 1)"
+    # The Rosetta rebuild still applies under --no-torch (mlx ships no x86_64
+    # wheels either), but the interpreter-version guard does not: nothing in a
+    # GGUF-only install imports torch, so deleting the venv to chase 3.13.9 is
+    # pure churn -- and a hard failure on a box that can fetch neither release.
+    assert_eq "--no-torch leaves a 3.13.8 Apple Silicon venv alone" \
+        "arm64 3.13.8 | " "$(_run_guard '' macos arm64 arm64 3.13.8 '' '' true)"
+    assert_eq "--no-torch still rebuilds an x86_64 venv, just not the version" \
+        "arm64 3.13.8 | cpython-3.13-macos-aarch64-none" \
+        "$(_run_guard '' macos arm64 x86_64 3.13.3 3.13.8 '' true)"
+
     assert_eq "--python override is honoured, never rebuilt over" \
         "x86_64 3.13.3 | " "$(_run_guard 3.11 macos arm64 x86_64 3.13.3 '' '')"
     assert_eq "x86_64 host (Intel/Rosetta shell) is a no-op here" \

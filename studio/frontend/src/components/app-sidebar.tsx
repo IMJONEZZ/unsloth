@@ -384,7 +384,7 @@ export function AppSidebar() {
         : chatOnlyReason === "no_gpu"
           ? "Training needs an NVIDIA or AMD GPU."
           : chatOnlyReason === "detection_failed"
-            ? "PyTorch is installed but failed to import, so this host was never measured. Re-run the installer to repair it."
+            ? "PyTorch is installed but failed to import, so this host was never measured. Re-run the installer, then restart Studio."
             : undefined;
 
   // The backend MLX self-heal (utils/mlx_repair) can reinstall MLX in the
@@ -395,16 +395,19 @@ export function AppSidebar() {
   useEffect(() => {
     // Also while deferred: under the kill switch health settles nothing, so only a
     // first-use operation detects and a GPU host would stay chat-only until a refresh.
-    // detection_failed is recoverable the same way: a broken torch import is usually
-    // repaired by re-running the installer against the same tree, and without this the
-    // user would sit on a greyed-out Train until they restarted Studio by hand.
-    if (
-      !chatOnly ||
-      (chatOnlyReason !== "mlx_unavailable" &&
-        chatOnlyReason !== "detection_failed" &&
-        !detectionDeferred)
-    )
-      return;
+    //
+    // detection_failed is deliberately NOT here, tempting as it looks. Both arms
+    // above have something that revises the verdict inside the running backend:
+    // mlx_repair calls detect_hardware() after its reinstall, and a deferred
+    // verdict leaves DEVICE unset so the next hardware-dependent call settles it.
+    // detection_failed has neither -- it sets DEVICE=CPU and DETECTION_COMPLETE,
+    // and /api/health then returns at `if DETECTION_COMPLETE.is_set() and DEVICE
+    // is not None` without ever reaching start_background_detection(). `force`
+    // only bypasses the frontend's own cache; no query param reaches the backend.
+    // Polling it would be an unending request every 15s that cannot change its
+    // own answer, so the tooltip says to restart instead, which is what the
+    // backend's own detection_failed message says too.
+    if (!chatOnly || (chatOnlyReason !== "mlx_unavailable" && !detectionDeferred)) return;
     const id = window.setInterval(() => {
       void fetchDeviceType({ force: true }).catch(() => undefined);
     }, 15000);

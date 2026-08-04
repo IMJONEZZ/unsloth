@@ -237,15 +237,44 @@ test("a deferred verdict is recorded so the sidebar can poll out of it", async (
     "the store never records that the verdict came from a deferred reply",
   );
   // Matched as two claims joined by an elastic gap, not one literal: the guard
-  // grows a new `chatOnlyReason !== "..."` clause every time another reason
-  // becomes recoverable (detection_failed was the second), and Biome rewraps the
-  // condition across lines when it does. A literal anchor goes stale on
+  // gains a clause whenever another reason becomes recoverable, and Biome rewraps
+  // the condition across lines when it does. A literal anchor goes stale on
   // formatting alone while the behaviour it guards is intact. The gap is bounded
   // so dropping !detectionDeferred entirely still fails.
   assert.match(
     sidebar,
     /chatOnlyReason !== "mlx_unavailable"[\s\S]{0,240}?!detectionDeferred/,
     "the recovery poll still ignores a deferred verdict, so it never recovers",
+  );
+});
+
+// Both arms of that poll have something that revises the verdict inside the running
+// backend: utils/mlx_repair calls detect_hardware() after its reinstall, and a deferred
+// verdict leaves DEVICE unset so the next hardware-dependent call settles it.
+// detection_failed has neither. ensure_hardware_detected() sets DEVICE=CPU and
+// DETECTION_COMPLETE, and main._await_hardware_detection returns at
+// `if DETECTION_COMPLETE.is_set() and DEVICE is not None` without ever reaching
+// start_background_detection(). fetchDeviceType({ force: true }) only bypasses the
+// frontend's own cache -- no query param reaches the server -- so adding it here buys
+// an unending 15s request that cannot change its own answer. The tooltip has to send
+// the user to a restart instead, which is what the backend's own message does.
+test("the recovery poll does not chase a verdict the backend cannot revise", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const sidebar = await readFile(
+    new URL("../src/components/app-sidebar.tsx", import.meta.url),
+    "utf8",
+  );
+  const pollAt = sidebar.indexOf("const id = window.setInterval(");
+  assert.ok(pollAt > 0, "the recovery poll moved");
+  const guard = sidebar.slice(sidebar.lastIndexOf("useEffect(", pollAt), pollAt);
+  assert.ok(
+    !/chatOnlyReason\s*!==\s*"detection_failed"/.test(guard),
+    "the poll re-fetches a settled detection_failed verdict the backend never re-runs",
+  );
+  assert.match(
+    sidebar,
+    /"detection_failed"[\s\S]{0,300}?restart Studio/,
+    "the detection_failed hint omits the restart that is the only thing which recovers",
   );
 });
 

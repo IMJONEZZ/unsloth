@@ -1736,8 +1736,18 @@ exit 0
         return $true
     }
 
+    # Whether a failed refresh is fatal depends on what is already here, exactly as
+    # in install.sh. With no uv at all there is nothing to fall back to. With an
+    # existing but older uv it must not be: raising UvMinVersion pulled every
+    # 0.8.16-0.9.2 host into the block below, and those installs used to succeed
+    # without touching the network. The floor only exists so the uv-managed path
+    # can *prefer* a newer interpreter, and Windows does not take that path anyway
+    # -- Find-CompatiblePython hands `uv venv` a resolved --python path, and it
+    # already screens out the builds that cannot import torch.
+    $UvPresentBefore = [bool](Get-Command uv -ErrorAction SilentlyContinue)
+
     if (-not (Test-UvVersionOk)) {
-        if (Get-Command uv -ErrorAction SilentlyContinue) {
+        if ($UvPresentBefore) {
             substep "updating uv package manager..."
         } else {
             substep "installing uv package manager..."
@@ -1776,9 +1786,16 @@ exit 0
     }
 
     if (-not (Test-UvVersionOk)) {
-        step "uv" "could not be installed" "Red"
-        substep "Install it from https://docs.astral.sh/uv/" "Yellow"
-        return (Exit-InstallFailure "uv could not be installed")
+        if ($UvPresentBefore) {
+            # An old uv still creates venvs and installs wheels. Say so and carry on
+            # rather than failing a host that was installing fine before the floor moved.
+            substep "[WARN] uv is older than $UvMinVersion and could not be refreshed -- continuing with the installed uv." "Yellow"
+            Write-TauriLog "WARN" "uv is older than $UvMinVersion and could not be refreshed"
+        } else {
+            step "uv" "could not be installed" "Red"
+            substep "Install it from https://docs.astral.sh/uv/" "Yellow"
+            return (Exit-InstallFailure "uv could not be installed")
+        }
     }
 
     # When bytecode compilation is enabled, large installs can exceed uv's 60s
@@ -2857,13 +2874,31 @@ exit 0
     # from one run and the message from a second, because POSIX sh cannot easily
     # capture both at once. One run yields both here, which is observably identical
     # and cannot report a status from one process and a message from another.
+    #
+    # TimedOut is a third verdict, not a flavour of Ok=$false, for the reason
+    # install.sh gives at its own gate: a probe that never reported anything has not
+    # shown that torch is broken. A wedged GPU driver blocks the import outright
+    # (#7706, why Get-InstalledTorchTag reads version.py off disk instead), and a
+    # first-ever load of the freshly written torch\lib + nvidia\*\lib DLLs through
+    # Defender's on-access scanner is legitimately slow. Reinstalling cannot unwedge
+    # a driver, and failing would roll a probably-fine venv back, so the caller warns
+    # and continues. 0 means "take the default": 180s to match install.sh, overridable
+    # with UNSLOTH_TORCH_IMPORT_TIMEOUT (seconds), which Windows previously had no way
+    # to reach at all.
     function Test-TorchImport {
         param(
             [string]$PythonExe,
-            [int]$TimeoutMs = 30000
+            [int]$TimeoutMs = 0
         )
+        if ($TimeoutMs -le 0) {
+            $seconds = 180
+            if ($env:UNSLOTH_TORCH_IMPORT_TIMEOUT -match '^\s*([0-9]+)\s*$' -and [int]$Matches[1] -gt 0) {
+                $seconds = [int]$Matches[1]
+            }
+            $TimeoutMs = $seconds * 1000
+        }
         if (-not $PythonExe -or -not (Test-Path -LiteralPath $PythonExe)) {
-            return [pscustomobject]@{ Ok = $false; Error = "no interpreter at $PythonExe" }
+            return [pscustomobject]@{ Ok = $false; TimedOut = $false; Error = "no interpreter at $PythonExe" }
         }
         try {
             $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -2881,13 +2916,13 @@ exit 0
                 try { $proc.Kill() } catch {}
                 # Floor, not [int]: PowerShell rounds .5 to even, so [int](1500/1000)
                 # would report 2s for a 1.5s budget.
-                $seconds = [math]::Floor($TimeoutMs / 1000)
-                return [pscustomobject]@{ Ok = $false; Error = "import torch did not finish within ${seconds}s" }
+                $killedAfter = [math]::Floor($TimeoutMs / 1000)
+                return [pscustomobject]@{ Ok = $false; TimedOut = $true; Error = "import torch did not finish within ${killedAfter}s" }
             }
             [void]$outTask.GetAwaiter().GetResult()
             $stderr = $errTask.GetAwaiter().GetResult().Trim()
             # Exit code is the test, not stderr: a healthy torch still warns on stderr.
-            if ($proc.ExitCode -eq 0) { return [pscustomobject]@{ Ok = $true; Error = "" } }
+            if ($proc.ExitCode -eq 0) { return [pscustomobject]@{ Ok = $true; TimedOut = $false; Error = "" } }
             # Last non-blank line: an import failure prints a full traceback and the
             # exception itself is the part a user can act on.
             if ($stderr) {
@@ -2895,9 +2930,9 @@ exit 0
             } else {
                 $detail = "exit code $($proc.ExitCode), no error output"
             }
-            return [pscustomobject]@{ Ok = $false; Error = $detail }
+            return [pscustomobject]@{ Ok = $false; TimedOut = $false; Error = $detail }
         } catch {
-            return [pscustomobject]@{ Ok = $false; Error = $_.Exception.Message }
+            return [pscustomobject]@{ Ok = $false; TimedOut = $false; Error = $_.Exception.Message }
         }
     }
 
@@ -3395,7 +3430,7 @@ exit 0
     # every path where no index was resolved while torch is still expected.
     if (-not $SkipTorch) {
         $torchImport = Test-TorchImport -PythonExe $VenvPython
-        if (-not $torchImport.Ok) {
+        if (-not $torchImport.Ok -and -not $torchImport.TimedOut) {
             substep "[WARN] PyTorch is installed but cannot be imported:" "Yellow"
             substep "[WARN]   $($torchImport.Error)" "Yellow"
             substep "reinstalling PyTorch once before giving up..."
@@ -3404,7 +3439,16 @@ exit 0
             [void](Invoke-TorchTrioReinstall)
             $torchImport = Test-TorchImport -PythonExe $VenvPython
         }
-        if (-not $torchImport.Ok) {
+        if ($torchImport.TimedOut) {
+            # Same verdict as install.sh: the import never reported anything, so we
+            # have not learned that torch is broken. Leave the install in place.
+            substep "[WARN] PyTorch did not finish importing in time." "Yellow"
+            substep "[WARN] That usually means a wedged GPU driver rather than a bad install," "Yellow"
+            substep "[WARN] so the install is being left in place. If Train is unavailable," "Yellow"
+            substep "[WARN] reboot and re-run, or raise UNSLOTH_TORCH_IMPORT_TIMEOUT." "Yellow"
+            Write-TauriLog "WARN" "PyTorch import timed out; leaving the install in place"
+        }
+        elseif (-not $torchImport.Ok) {
             $torchPyVer = (& $VenvPython -c "import sys; print('{}.{}.{}'.format(*sys.version_info[:3]))" 2>$null | Out-String).Trim()
             if (-not $torchPyVer) { $torchPyVer = "unknown" }
             Write-Host ""

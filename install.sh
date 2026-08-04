@@ -2514,6 +2514,13 @@ fi
 # carrying only that fix, so the bad set is the tail of the 3.13 series below
 # 3.13.9. The bounds are named and compared as a range so a future bad patch is
 # a one-line change rather than another exact-string equality to bolt on.
+#
+# Skipped under SKIP_TORCH (--no-torch, Intel Mac): the only thing wrong with
+# these interpreters is `import torch`, which such an install never performs.
+# Rebuilding anyway deletes a working GGUF-only venv to chase a constraint that
+# does not apply, and on a host that cannot reach 3.13.9 or 3.12 -- an air-gapped
+# box, the case the uv floor above is careful to keep working -- it turns a
+# chat-only install that used to succeed into a hard failure.
 _PY_BAD_FLOOR="3.13.8"
 _PY_BAD_CEIL="3.13.9"
 _PY_RECOVER_PRIMARY=">=3.13.9,<3.14"
@@ -2534,7 +2541,7 @@ _python_cannot_import_torch() {
     return 0
 }
 
-if [ -x "$VENV_DIR/bin/python" ]; then
+if [ "$SKIP_TORCH" = false ] && [ -x "$VENV_DIR/bin/python" ]; then
     _info=$(_inspect_venv)
     _PY_VER=${_info##* }
     if _python_cannot_import_torch "$_PY_VER"; then
@@ -4434,6 +4441,60 @@ _reinstall_torch_trio() {
     fi
 }
 
+# Probe the import Studio will actually run, not a barer one. On Linux the
+# dynamic linker searches LD_LIBRARY_PATH *before* the DT_RUNPATH baked into
+# torch's .so files (ld.so(8) search order), so an inherited LD_LIBRARY_PATH
+# pointing at a different system CUDA -- a conda env, an nvidia/cuda Docker base
+# image -- shadows the wheel's own bundled libs and `import torch` dies with an
+# undefined-symbol error. studio/backend/run.py repairs exactly that at the entry
+# point (_fix_torch_cuda_ld_path + a single re-exec) before importing torch, so
+# such a host runs Studio fine. A probe without the same preparation would call
+# that install broken, reinstall the identical wheel, fail again and exit 1 --
+# rolling the environment back over a linker-ordering problem the wheel cannot
+# fix. Compute the same ordering once (find_spec only, no torch import) and run
+# every probe under it. Stays empty when there is nothing to correct, which is
+# the usual case, and the probes then exec unchanged.
+_TORCH_PROBE_LD_PATH=""
+_torch_probe_ld_path() {
+    [ "$OS" != "macos" ] || return 0
+    [ -n "${LD_LIBRARY_PATH:-}" ] || return 0
+    "$_VENV_PY" -c '
+import importlib.util, os, sys
+spec = importlib.util.find_spec("torch")
+if not spec or not spec.origin:
+    sys.exit(1)
+torch_dir = os.path.dirname(spec.origin)
+dirs = []
+torch_lib = os.path.join(torch_dir, "lib")
+if os.path.isdir(torch_lib):
+    dirs.append(torch_lib)
+nvidia = os.path.join(os.path.dirname(torch_dir), "nvidia")
+if os.path.isdir(nvidia):
+    for sub in sorted(os.listdir(nvidia)):
+        lib = os.path.join(nvidia, sub, "lib")
+        if os.path.isdir(lib):
+            dirs.append(lib)
+if not dirs:
+    sys.exit(1)
+existing = os.environ.get("LD_LIBRARY_PATH", "").split(":")
+if existing[:len(dirs)] == dirs:
+    sys.exit(1)  # already in front, nothing to correct
+keep = [p for p in existing if p not in set(dirs)]
+print(":".join(dirs + keep))
+' 2>/dev/null || return 0
+}
+
+# Run "$@" under the corrected library path when there is one. A subshell keeps
+# the export out of the installer's own environment, and exec preserves the exit
+# status the callers read -- timeout(1)'s 124 in particular.
+_torch_probe_exec() {
+    if [ -n "$_TORCH_PROBE_LD_PATH" ]; then
+        ( LD_LIBRARY_PATH="$_TORCH_PROBE_LD_PATH"; export LD_LIBRARY_PATH; exec "$@" )
+    else
+        "$@"
+    fi
+}
+
 # `import torch` can block forever rather than fail -- a wedged Intel driver is
 # the known case, which is why _PREV_TORCH_VER above reads version.py off disk
 # instead of starting an interpreter. This gate has to run the import for real,
@@ -4448,13 +4509,14 @@ _reinstall_torch_trio() {
 _TORCH_IMPORT_TIMEOUT="${UNSLOTH_TORCH_IMPORT_TIMEOUT:-180}"
 _torch_import_probe() {
     if command -v timeout >/dev/null 2>&1; then
-        timeout "$_TORCH_IMPORT_TIMEOUT" "$_VENV_PY" -c "import torch" >/dev/null 2>&1
+        _torch_probe_exec timeout "$_TORCH_IMPORT_TIMEOUT" "$_VENV_PY" -c "import torch" >/dev/null 2>&1
     else
-        "$_VENV_PY" -c "import torch" >/dev/null 2>&1
+        _torch_probe_exec "$_VENV_PY" -c "import torch" >/dev/null 2>&1
     fi
 }
 
 if [ "$SKIP_TORCH" = false ]; then
+    _TORCH_PROBE_LD_PATH=$(_torch_probe_ld_path)
     _torch_import_ok=false
     _torch_import_timed_out=false
     if _torch_import_probe; then

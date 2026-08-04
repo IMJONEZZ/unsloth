@@ -105,11 +105,12 @@ printf '%s | %s\n' "$final" "$(paste -sd';' "$RECREATE_LOG" 2>/dev/null)"
 GUARD_RUNNER_EOF
 
     # Returns "<final_version> | <recreate_selectors>"; exit code is the guard's.
-    _run_guard() {  # OS _ARCH _USER_PYTHON INIT_VER NO_313_9 NO_312 FAKE_MACHINE
+    _run_guard() {  # OS _ARCH _USER_PYTHON INIT_VER NO_313_9 NO_312 FAKE_MACHINE SKIP_TORCH
         _vd=$(mktemp -d)
         _rl=$(mktemp)
         env OS="$1" _ARCH="$2" _USER_PYTHON="$3" INIT_VER="$4" \
-            NO_313_9="$5" NO_312="$6" FAKE_MACHINE="${7:-x86_64}" RECREATE_LOG="$_rl" \
+            NO_313_9="$5" NO_312="$6" FAKE_MACHINE="${7:-x86_64}" \
+            SKIP_TORCH="${8:-false}" RECREATE_LOG="$_rl" \
             bash "$_GUARD_RUNNER" "$_GUARD_FILE" "$_HELPERS_FILE" "$_vd/venv"
         _rc=$?
         rm -rf "$_vd"; rm -f "$_rl"
@@ -150,6 +151,23 @@ GUARD_RUNNER_EOF
         "3.13.12 | cpython->=3.13.9,<3.14-macos-aarch64-none" \
         "$(_run_guard macos arm64 '' 3.13.8 '' '' arm64)"
 
+    # --no-torch never imports torch, so the one defect in these interpreters
+    # cannot bite. Rebuilding would delete a working GGUF-only venv, and on a box
+    # that can reach neither 3.13.9 nor 3.12 it would abort an install that used
+    # to succeed. Leave it exactly as found.
+    assert_eq "--no-torch leaves a 3.13.8 venv alone instead of rebuilding it" \
+        "3.13.8 | " \
+        "$(_run_guard linux x86_64 '' 3.13.8 '' '' x86_64 true)"
+
+    set +e
+    _skip_torch_offline_out=$(_run_guard linux x86_64 '' 3.13.8 1 1 x86_64 true 2>/dev/null)
+    _skip_torch_offline_rc=$?
+    set -e
+    assert_eq "--no-torch with no reachable Python still succeeds" \
+        "0" "$_skip_torch_offline_rc"
+    assert_eq "--no-torch keeps the venv when no replacement could be fetched" \
+        "3.13.8 | " "$_skip_torch_offline_out"
+
     # Both rebuilds failing must be fatal: continuing would reproduce exactly the
     # silent chat-only install this guard exists to prevent.
     set +e
@@ -189,9 +207,26 @@ tauri_log() { :; }
 cat > "$VENV_BIN" << 'PY_EOF'
 #!/usr/bin/env bash
 case "$2" in
+    *find_spec*)
+        # Stands in for the real find_spec walk: the lib dirs this wheel would
+        # contribute, in front of whatever LD_LIBRARY_PATH was inherited.
+        echo "ld-probe" >> "${LD_PROBE_LOG:-/dev/null}"
+        [ -n "$FAKE_TORCH_LD_DIRS" ] || exit 1
+        printf '%s\n' "${FAKE_TORCH_LD_DIRS}:${LD_LIBRARY_PATH}" ;;
     *"import torch"*)
         # A wedged GPU driver blocks the import instead of failing it.
         if [ -n "$TORCH_WEDGE" ]; then sleep 30; exit 0; fi
+        # A system CUDA ahead of the wheel's own libs on LD_LIBRARY_PATH is what
+        # ld.so resolves first, and the import dies on an undefined symbol.
+        # Studio's entry point corrects the ordering before importing, so a probe
+        # that does the same sees the working import Studio will see.
+        if [ -n "$LD_BREAKS_IMPORT" ] && [ -n "$LD_LIBRARY_PATH" ]; then
+            case ":$LD_LIBRARY_PATH:" in
+                ":$FAKE_TORCH_LD_DIRS:"*) ;;
+                *) echo "ImportError: libtorch_cuda.so: undefined symbol: ncclCommRegister" >&2
+                   exit 1 ;;
+            esac
+        fi
         if [ -f "$TORCH_OK_MARKER" ]; then exit 0; fi
         echo "IndentationError: expected an indented block after function definition on line 4" >&2
         exit 1 ;;
@@ -278,6 +313,50 @@ GATE_RUNNER_EOF
         rm -f "$_bin" "$_marker"
         return $_rc
     }
+
+    # An inherited LD_LIBRARY_PATH pointing at a different system CUDA shadows the
+    # wheel's bundled libs, because ld.so searches LD_LIBRARY_PATH before the
+    # DT_RUNPATH in torch's .so files. studio/backend/run.py repairs that ordering
+    # and re-execs before importing, so the host runs Studio fine; a probe without
+    # the same preparation would reinstall the identical wheel, fail again and roll
+    # back a good environment over a linker-ordering problem.
+    _LD_PROBE_LOG=$(mktemp)
+    _run_gate_ld() {  # LD_LIBRARY_PATH torch_lib_dirs
+        _bin=$(mktemp)
+        # The wheel itself is fine: the library path is the only thing that can
+        # make this import fail, so the gate's verdict is about that and nothing else.
+        _marker=$(mktemp); : > "$_marker"
+        : > "$_GATE_CALLS"; : > "$_LD_PROBE_LOG"
+        set +e
+        env SKIP_TORCH=false TORCH_INDEX_URL="https://download.pytorch.org/whl/cu128" \
+            REPAIR_WORKS="" TORCH_OK_MARKER="$_marker" CALL_LOG="$_GATE_CALLS" \
+            FAKE_PY_VER="3.13.12" LD_BREAKS_IMPORT=1 LD_LIBRARY_PATH="$1" \
+            FAKE_TORCH_LD_DIRS="$2" LD_PROBE_LOG="$_LD_PROBE_LOG" \
+            bash "$_GATE_RUNNER" "$_GATE_FILE" "$_bin" > /dev/null 2>&1
+        _rc=$?
+        set -e
+        rm -f "$_bin" "$_marker"
+        return $_rc
+    }
+
+    _run_gate_ld "/usr/local/cuda-13/lib64" "/fake/site-packages/torch/lib" && _rc=0 || _rc=$?
+    assert_eq "a conflicting system CUDA on LD_LIBRARY_PATH does not fail the install" \
+        "0" "$_rc"
+    assert_eq "the library-path fix means no pointless reinstall of the same wheel" \
+        "" "$(cat "$_GATE_CALLS")"
+
+    # Control: with no lib dirs to prepend the probe is the bare import again, so
+    # this case must still fail. Without it the assertion above could pass for the
+    # wrong reason (a fake interpreter that never breaks).
+    _run_gate_ld "/usr/local/cuda-13/lib64" "" && _rc=0 || _rc=$?
+    assert_eq "an unfixable library path still fails the install" "1" "$_rc"
+
+    # The common case: nothing inherited, nothing to correct, no extra subprocess.
+    _run_gate_ld "" "/fake/site-packages/torch/lib" && _rc=0 || _rc=$?
+    assert_eq "an empty LD_LIBRARY_PATH passes the gate" "0" "$_rc"
+    assert_eq "an empty LD_LIBRARY_PATH skips the library-path probe entirely" \
+        "" "$(cat "$_LD_PROBE_LOG")"
+    rm -f "$_LD_PROBE_LOG"
 
     _GATE_OUT_FILE=$(mktemp)
     if command -v timeout >/dev/null 2>&1; then
