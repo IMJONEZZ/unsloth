@@ -376,9 +376,9 @@ def test_reinstall_prefers_the_rocm_index_with_pinned_companions():
     )
     assert "reinstall PyTorch (ROCm)" in out
     assert "repo.amd.com/rocm/whl/gfx1151" in out
-    assert "torchvision>=0.26.0,<0.27.0" in out, (
-        "a bare companion resolves an ABI-incompatible build"
-    )
+    assert (
+        "torchvision>=0.26.0,<0.27.0" in out
+    ), "a bare companion resolves an ABI-incompatible build"
 
 
 # ── The auto ROCm reroute sets a torch floor but no companion pins ──
@@ -538,6 +538,6 @@ def test_the_gate_reports_through_a_script_scoped_sentinel_not_its_return_value(
         source.count("if ($null -ne $script:TorchGateFailure) { return $script:TorchGateFailure }")
         == 2
     )
-    assert "= Invoke-TorchImportGate" not in source, (
-        "the gate's verdict must not be read from its return value"
-    )
+    assert (
+        "= Invoke-TorchImportGate" not in source
+    ), "the gate's verdict must not be read from its return value"
