@@ -61,11 +61,13 @@ foreach ($p in @("", "linux-x86_64", "macosx-14.0-arm64", "win32")) {
 Check "an uppercase arm64 is still arm64" ((Get-XpuTorchSpecs -Platform "WIN-ARM64").Count -eq 2)
 Check "the probe lowercases its answer"   ((Get-FunctionAst "Get-VenvPlatformTag").Extent.Text -match 'ToLowerInvariant')
 
-# --- both call sites go through it -----------------------------------------------------------
+# --- every call site goes through it ---------------------------------------------------------
 # Text, not AST, for the call count: asserting the COUNT catches a copy that quietly
-# reintroduces its own literal trio.
+# reintroduces its own literal trio. Three sites now -- the fresh install, the flavor
+# repair, and the post-install import gate's repair, which used a generic ">=2.4" range
+# and so could resolve an XPU wheel below the 2.6 floor unsloth/models/_utils.py requires.
 $src = Get-Content -Raw -LiteralPath $installPs1
-Check "builder is used at 2 sites" (([regex]::Matches($src, 'Get-XpuTorchSpecs -Platform')).Count -eq 2)
+Check "builder is used at 3 sites" (([regex]::Matches($src, 'Get-XpuTorchSpecs -Platform')).Count -eq 3)
 # The literal trio must exist in exactly ONE place now (the builder itself), or the drift is back.
 Check "one literal torchaudio 2.6 pin" (([regex]::Matches($src, '"torchaudio>=2\.6,<2\.11\.0"')).Count -eq 1)
 
