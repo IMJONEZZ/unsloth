@@ -113,21 +113,19 @@ def _screen_script(versions: list[str]) -> str:
     return f'$ErrorActionPreference = "Stop"\n{screen}\n{checks}\n'
 
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("pwsh") is None, reason = "PowerShell is unavailable"
-)
+pytestmark = pytest.mark.skipif(shutil.which("pwsh") is None, reason = "PowerShell is unavailable")
 
 
 @pytest.mark.parametrize(
     ("version", "expected"),
     [
-        ("3.13.7", "False"),   # predates the regression
-        ("3.13.8", "True"),    # the broken release
-        ("3.13.9", "False"),   # the expedited fix
+        ("3.13.7", "False"),  # predates the regression
+        ("3.13.8", "True"),  # the broken release
+        ("3.13.9", "False"),  # the expedited fix
         ("3.13.12", "False"),
         ("3.12.10", "False"),
         ("3.14.0", "False"),
-        ("", "False"),         # unknown version is not ours to reject
+        ("", "False"),  # unknown version is not ours to reject
         ("not-a-version", "False"),
     ],
 )
