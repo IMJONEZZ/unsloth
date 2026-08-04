@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import os
 import re
+import sys
+import textwrap
 import shutil
 import stat
 import subprocess
@@ -61,9 +63,28 @@ def _pwsh(script: str) -> str:
 
 
 def _fake_python(tmp_path: Path, name: str, body: str) -> Path:
-    """A stand-in interpreter. ProcessStartInfo runs it the same way it runs python."""
+    """A stand-in interpreter. ProcessStartInfo runs it the same way it runs python.
+
+    ``body`` is Python, run by this interpreter through a tiny launcher, rather
+    than a shell snippet in a ``#!/bin/sh`` file. A file with no extension and a
+    shebang is not executable on Windows -- ProcessStartInfo rejects it with "not
+    a valid application for this OS platform" -- so the shell version could only
+    ever run on the platforms this file is *not* named for.
+    """
+    script = tmp_path / f"{name}_impl.py"
+    script.write_text(
+        "import sys, time  # noqa: F401\n" + textwrap.dedent(body) + "\n",
+        encoding = "utf-8",
+    )
+    if os.name == "nt":
+        path = tmp_path / f"{name}.cmd"
+        path.write_text(
+            f'@echo off\r\n"{sys.executable}" "{script}" %*\r\nexit /b %ERRORLEVEL%\r\n',
+            encoding = "utf-8",
+        )
+        return path
     path = tmp_path / name
-    path.write_text(f"#!/bin/sh\n{body}\n", encoding = "utf-8")
+    path.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n', encoding = "utf-8")
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return path
 
@@ -85,7 +106,7 @@ Write-Output ("ERR=" + $r.Error)
 
 
 def test_healthy_torch_reports_ok(tmp_path):
-    py = _fake_python(tmp_path, "python_ok", "exit 0")
+    py = _fake_python(tmp_path, "python_ok", "sys.exit(0)")
     out = _pwsh(_probe_script(str(py)))
     assert "OK=True" in out
     assert "ERR=" in out
@@ -94,7 +115,9 @@ def test_healthy_torch_reports_ok(tmp_path):
 def test_healthy_torch_that_warns_on_stderr_is_still_ok(tmp_path):
     # Exit code is the test, not stderr: torch warns on stderr routinely, and
     # treating any stderr output as failure would fail every healthy install.
-    py = _fake_python(tmp_path, "python_warns", "echo 'UserWarning: something' >&2\nexit 0")
+    py = _fake_python(
+        tmp_path, "python_warns", "print('UserWarning: something', file = sys.stderr)\nsys.exit(0)"
+    )
     out = _pwsh(_probe_script(str(py)))
     assert "OK=True" in out
 
@@ -102,13 +125,12 @@ def test_healthy_torch_that_warns_on_stderr_is_still_ok(tmp_path):
 def test_broken_torch_surfaces_the_real_exception(tmp_path):
     # The gh-139783 shape, traceback and all. The last line is what a user can act on.
     body = (
-        "cat >&2 <<'EOF'\n"
-        "Traceback (most recent call last):\n"
+        "sys.stderr.write('''Traceback (most recent call last):\n"
         '  File "<string>", line 1, in <module>\n'
         "    import torch\n"
         "IndentationError: expected an indented block after function definition on line 4\n"
-        "EOF\n"
-        "exit 1"
+        "''')\n"
+        "sys.exit(1)"
     )
     py = _fake_python(tmp_path, "python_broken", body)
     out = _pwsh(_probe_script(str(py)))
@@ -117,7 +139,7 @@ def test_broken_torch_surfaces_the_real_exception(tmp_path):
 
 
 def test_silent_failure_still_reports_something_actionable(tmp_path):
-    py = _fake_python(tmp_path, "python_silent", "exit 3")
+    py = _fake_python(tmp_path, "python_silent", "sys.exit(3)")
     out = _pwsh(_probe_script(str(py)))
     assert "OK=False" in out
     assert "exit code 3" in out
@@ -126,7 +148,7 @@ def test_silent_failure_still_reports_something_actionable(tmp_path):
 def test_a_wedged_import_is_killed_rather_than_hanging(tmp_path):
     # A hung `import torch` must not hang the installer. 1500ms so the test is quick;
     # the installer's own default is 180s, matching install.sh.
-    py = _fake_python(tmp_path, "python_hangs", "sleep 30")
+    py = _fake_python(tmp_path, "python_hangs", "time.sleep(30)")
     out = _pwsh(_probe_script(str(py), timeout_ms = 1500))
     assert "OK=False" in out
     assert "did not finish within 1s" in out
@@ -134,7 +156,9 @@ def test_a_wedged_import_is_killed_rather_than_hanging(tmp_path):
 
 
 def test_a_real_import_failure_is_not_reported_as_a_timeout(tmp_path):
-    py = _fake_python(tmp_path, "python_broken", "echo 'ImportError: boom' >&2\nexit 1")
+    py = _fake_python(
+        tmp_path, "python_broken", "print('ImportError: boom', file = sys.stderr)\nsys.exit(1)"
+    )
     out = _pwsh(_probe_script(str(py)))
     assert "OK=False" in out and "TIMEDOUT=False" in out
 
@@ -148,7 +172,7 @@ def test_the_default_bound_matches_install_sh_and_is_overridable(tmp_path):
     assert "UNSLOTH_TORCH_IMPORT_TIMEOUT" in probe, "Windows has no way to raise the bound"
 
     # Executed, not just grepped: prove the env var actually reaches the wait.
-    py = _fake_python(tmp_path, "python_hangs_env", "sleep 30")
+    py = _fake_python(tmp_path, "python_hangs_env", "time.sleep(30)")
     script = f"""
 $env:UNSLOTH_TORCH_IMPORT_TIMEOUT = '1'
 {probe}
