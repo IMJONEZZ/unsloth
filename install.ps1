@@ -2915,8 +2915,11 @@ exit 0
             $errTask = $proc.StandardError.ReadToEndAsync()
             $finished = $proc.WaitForExit($TimeoutMs)
             if (-not $finished) {
+                # Kill the tree where the runtime can: a wedged import that had already
+                # spawned a helper leaves that helper holding the DLLs and the pipes.
+                # Kill(bool) is .NET Core only, so Windows PowerShell 5.1 falls back.
                 $killed = $true
-                try { $proc.Kill() } catch { $killed = $false }
+                try { $proc.Kill($true) } catch { try { $proc.Kill() } catch { $killed = $false } }
                 # Kill() only asks. Returning while the process is still dying leaves it
                 # holding torch\lib and nvidia\*\lib DLLs, and on Windows the uv
                 # reinstalls that follow fail on a locked file -- rolling back a venv
@@ -2926,10 +2929,11 @@ exit 0
                 if ($killed) { $exited = $proc.WaitForExit(15000) }
                 if ($exited) {
                     # Drain the redirected pipes so the reader tasks and their handles go
-                    # with the process. Only once it has exited: while it is alive these
-                    # block, which is the deadlock the async reads exist to avoid.
-                    try { [void]$outTask.GetAwaiter().GetResult() } catch {}
-                    try { [void]$errTask.GetAwaiter().GetResult() } catch {}
+                    # with the process. Bounded too, and never GetResult(): a grandchild
+                    # that inherited the handles holds them open after its parent dies,
+                    # and blocking there is the deadlock the async reads exist to avoid.
+                    try { [void]$outTask.Wait(2000) } catch {}
+                    try { [void]$errTask.Wait(2000) } catch {}
                 }
                 # Floor, not [int]: PowerShell rounds .5 to even, so a 1.5s budget would report 2s.
                 $killedAfter = [math]::Floor($TimeoutMs / 1000)

@@ -169,16 +169,22 @@ def test_a_timed_out_probe_is_waited_out_before_the_installer_moves_on():
     branch = probe[probe.index("if (-not $finished)") :]
     branch = branch[: branch.index("return [pscustomobject]")]
 
-    kill_at = branch.index(".Kill()")
+    kill_at = branch.index(".Kill(")
     wait_at = branch.index("WaitForExit(")
     assert kill_at < wait_at, "the wait has to follow the kill"
     assert re.search(r"WaitForExit\(\s*\d+\s*\)", branch), (
         "an unbounded WaitForExit() here hangs the installer on the very process "
         "that already proved it does not finish"
     )
-    drain_at = branch.index("GetAwaiter().GetResult()")
+    drain_at = branch.index(".Wait(")
     assert wait_at < drain_at, "draining a process that has not exited blocks"
-    assert branch.count("GetAwaiter().GetResult()") == 2, "both pipes have to be drained"
+    assert branch.count("GetAwaiter().GetResult()") == 0, (
+        "an unbounded read blocks for as long as any grandchild that inherited the "
+        "handles keeps them open, which is the deadlock the async reads avoid"
+    )
+    assert len(re.findall(r"Task\.Wait\(|\$(?:out|err)Task\.Wait\(\s*\d+\s*\)", branch)) == 2, (
+        "both pipes have to be drained, and with a bound"
+    )
 
 
 def test_a_wedged_probe_still_returns_promptly(tmp_path):
@@ -192,6 +198,38 @@ def test_a_wedged_probe_still_returns_promptly(tmp_path):
     assert elapsed < 20, (
         f"the timeout path took {elapsed:.1f}s; the post-kill wait is meant to be "
         "the exception, not the rule"
+    )
+
+
+def test_a_grandchild_holding_the_pipes_does_not_stall_the_probe(tmp_path):
+    """The launcher is not always the process that holds the handles.
+
+    On Windows the interpreter is reached through a .cmd, so Kill() ends cmd.exe
+    and leaves python orphaned with the inherited pipes still open. Reading those
+    to the end then blocks for as long as the orphan lives -- 30s here, and a
+    wedged driver in production. This shape is what the bounded drains are for.
+    """
+    script = tmp_path / "slow_impl.py"
+    script.write_text("import time\ntime.sleep(30)\n", encoding = "utf-8")
+    if os.name == "nt":
+        launcher = tmp_path / "slow.cmd"
+        launcher.write_text(
+            f'@echo off\r\n"{sys.executable}" "{script}" %*\r\nexit /b %ERRORLEVEL%\r\n',
+            encoding = "utf-8",
+        )
+    else:
+        # No exec: the shell stays as the parent, exactly as cmd.exe does.
+        launcher = tmp_path / "slow"
+        launcher.write_text(f'#!/bin/sh\n"{sys.executable}" "{script}" "$@"\n', encoding = "utf-8")
+        launcher.chmod(launcher.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    started = time.monotonic()
+    out = _pwsh(_probe_script(str(launcher), timeout_ms = 1500))
+    elapsed = time.monotonic() - started
+    assert "TIMEDOUT=True" in out
+    assert elapsed < 25, (
+        f"the probe waited {elapsed:.1f}s on an orphan's pipes; the drains are bounded "
+        "so a grandchild cannot hold the installer"
     )
 
 
