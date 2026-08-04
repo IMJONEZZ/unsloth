@@ -140,6 +140,40 @@ def test_a_new_enough_uv_downloads_nothing(tmp_path):
     assert "continuing with the installed uv" not in out, out
 
 
+def test_a_uv_below_the_old_floor_offline_still_fails(tmp_path):
+    """The offline exception covers 0.8.16-0.9.2, not everything that is named uv.
+
+    Below the previous floor the installer rejected the uv outright, and it still
+    has to: those releases lack flags the install is about to hand them
+    (--default-index, --torch-backend), so continuing only moves the failure into
+    package replacement, well past the point where a venv rollback is cheap.
+    """
+    out = _run(tmp_path, "0.7.14")
+    assert "EXIT-FAILURE: uv could not be installed" in out, out
+    assert "REACHED-END" not in out, out
+    assert "continuing with the installed uv" not in out, out
+
+
+def test_the_old_floor_itself_is_inside_the_offline_exception(tmp_path):
+    """0.8.16 is the boundary and is on the accepted side of it."""
+    out = _run(tmp_path, "0.8.16")
+    assert "REACHED-END" in out, out
+    assert "EXIT-FAILURE" not in out, out
+    assert "continuing with the installed uv" in out, out
+
+
+def test_an_unreadable_uv_version_counts_as_present(tmp_path):
+    """A uv whose banner cannot be parsed is not evidence of an old uv.
+
+    Matching install.sh, which treats an unreadable version as good enough rather
+    than newly failing a host that installed fine before the floor moved.
+    """
+    out = _run(tmp_path, "")
+    assert "REACHED-END" in out, out
+    assert "EXIT-FAILURE" not in out, out
+    assert "continuing with the installed uv" in out, out
+
+
 def test_the_release_download_cannot_escape_as_a_terminating_error():
     """The pinned-release download is what would escape past the rollback; keep it wrapped.
 

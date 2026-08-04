@@ -2215,6 +2215,11 @@ tauri_log "STEP" "Installing uv package manager"
 # older uv resolves straight to the broken patch. This floor is the actual fix; the
 # interpreter guard below only repairs a venv that still slipped through.
 UV_MIN_VERSION="0.9.3"
+# The floor before this raised it. An offline host may keep a uv between the two,
+# since those installs worked without touching the network; below it the installer
+# rejected the uv outright, and later flags it does not have (--default-index,
+# --torch-backend) would fail well into package replacement instead.
+UV_OFFLINE_MIN_VERSION="0.8.16"
 
 # When bytecode compilation is enabled, large installs can exceed uv's 60s default on slow machines. Default to 180s, preserving overrides ("0" disables).
 : "${UV_COMPILE_BYTECODE_TIMEOUT:=180}"
@@ -2268,16 +2273,17 @@ version_ge() {
     return 0
 }
 
-_uv_version_ok() {
+_uv_version_ok() {  # uv command, floor (defaults to UV_MIN_VERSION)
+    _floor=${2:-$UV_MIN_VERSION}
     _raw=$("$1" --version 2>/dev/null | awk '{print $2}') || return 1
     [ -n "$_raw" ] || return 1
     _ver=${_raw%%[-+]*}
     case "$_ver" in
         ''|*[!0-9.]*) return 1 ;;
     esac
-    version_ge "$_ver" "$UV_MIN_VERSION" || return 1
+    version_ge "$_ver" "$_floor" || return 1
     # Prerelease of the exact minimum (e.g. 0.7.14-rc1) is still below stable 0.7.14
-    [ "$_ver" = "$UV_MIN_VERSION" ] && [ "$_raw" != "$_ver" ] && return 1
+    [ "$_ver" = "$_floor" ] && [ "$_raw" != "$_ver" ] && return 1
     return 0
 }
 
@@ -2301,8 +2307,20 @@ if ! command -v uv >/dev/null 2>&1 || ! _uv_version_ok uv; then
     # installs used to succeed without touching the network. An old uv still creates
     # venvs and the interpreter guard below repairs a bad Python via the 3.12
     # fallback, so an air-gapped box keeps working.
+    # Presence is not enough: the exception is for 0.8.16-0.9.2, the range that
+    # used to be accepted. An older uv was rejected before this floor moved and
+    # still has to be, or the install proceeds into venv and package replacement
+    # on a uv missing the flags it will be handed (--default-index,
+    # --torch-backend). An unreadable version is treated as good enough: that is
+    # a minimal image without awk, not an old uv, and failing there would break
+    # an install that worked before.
     _uv_present_before=false
-    command -v uv >/dev/null 2>&1 && _uv_present_before=true
+    if command -v uv >/dev/null 2>&1; then
+        _uv_prev_ver=$(uv --version 2>/dev/null | awk '{print $2}' 2>/dev/null)
+        if [ -z "$_uv_prev_ver" ] || _uv_version_ok uv "$UV_OFFLINE_MIN_VERSION"; then
+            _uv_present_before=true
+        fi
+    fi
 
     substep "installing uv package manager..."
     _uv_refreshed=true

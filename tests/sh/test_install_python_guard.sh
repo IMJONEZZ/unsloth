@@ -613,6 +613,7 @@ STUBS
     sed -n '/^version_ge()/,/^}/p' "$INSTALL_SH"
     sed -n '/^_uv_version_ok()/,/^}/p' "$INSTALL_SH"
     sed -n '/^UV_MIN_VERSION=/p' "$INSTALL_SH"
+    sed -n '/^UV_OFFLINE_MIN_VERSION=/p' "$INSTALL_SH"
     echo 'download() { return 1; }   # air-gapped'
     sed -n '/^if ! command -v uv >\/dev\/null 2>&1 || ! _uv_version_ok uv; then$/,/^fi$/p' "$INSTALL_SH"
     echo 'echo "REACHED_END"'
@@ -626,6 +627,31 @@ _off_out=$(PATH="$_OFFDIR:$PATH" HOME="$_OFFDIR" sh "$_UVBLK" 2>&1) && _off_rc=0
 assert_eq "offline with an existing old uv still completes (no hard failure)" "0" "$_off_rc"
 assert_contains "offline with an existing old uv reaches the rest of the install" \
     "$_off_out" "REACHED_END"
+
+# (a2) a uv below the floor that was in force before this change: it was rejected
+# then and must be now, or the install walks into venv and package replacement on a
+# uv without the flags it will be handed.
+printf '#!/bin/sh\n[ "$1" = --version ] && echo "uv 0.7.14"\nexit 0\n' > "$_OFFDIR/uv"
+chmod +x "$_OFFDIR/uv"
+_old_out=$(PATH="$_OFFDIR:$PATH" HOME="$_OFFDIR" sh "$_UVBLK" 2>&1) && _old_rc=0 || _old_rc=$?
+assert_eq "offline with a uv below the previous floor still fails" "1" "$_old_rc"
+assert_contains "offline with a uv below the previous floor says why" \
+    "$_old_out" "could not download uv"
+
+# (a3) the boundary itself: 0.8.16 was accepted before, so it still is.
+printf '#!/bin/sh\n[ "$1" = --version ] && echo "uv 0.8.16"\nexit 0\n' > "$_OFFDIR/uv"
+chmod +x "$_OFFDIR/uv"
+_edge_out=$(PATH="$_OFFDIR:$PATH" HOME="$_OFFDIR" sh "$_UVBLK" 2>&1) && _edge_rc=0 || _edge_rc=$?
+assert_eq "offline with a uv exactly on the previous floor completes" "0" "$_edge_rc"
+assert_contains "offline with a uv exactly on the previous floor reaches the install" \
+    "$_edge_out" "REACHED_END"
+
+# (a4) a uv whose version cannot be read at all -- a minimal image with no awk,
+# not an old uv. Failing there would break an install that worked before.
+printf '#!/bin/sh\nexit 0\n' > "$_OFFDIR/uv"
+chmod +x "$_OFFDIR/uv"
+_mute_out=$(PATH="$_OFFDIR:$PATH" HOME="$_OFFDIR" sh "$_UVBLK" 2>&1) && _mute_rc=0 || _mute_rc=$?
+assert_eq "offline with a uv that reports no version completes" "0" "$_mute_rc"
 
 # (b) no uv at all: nothing to fall back to, so this one must be fatal
 rm -f "$_OFFDIR/uv"
@@ -653,6 +679,7 @@ STUBS
     sed -n '/^version_ge()/,/^}/p' "$INSTALL_SH"
     sed -n '/^_uv_version_ok()/,/^}/p' "$INSTALL_SH"
     sed -n '/^UV_MIN_VERSION=/p' "$INSTALL_SH"
+    sed -n '/^UV_OFFLINE_MIN_VERSION=/p' "$INSTALL_SH"
     sed -n '/^download()/,/^}/p' "$INSTALL_SH"
     sed -n '/^if ! command -v uv >\/dev\/null 2>&1 || ! _uv_version_ok uv; then$/,/^fi$/p' "$INSTALL_SH"
     echo 'echo "REACHED_END"'

@@ -1624,17 +1624,34 @@ exit 0
     # carries CPython 3.13.9, the release that fixed the gh-139783 torch import
     # failure. Windows rarely takes the uv-managed path, but the two must agree.
     $UvMinVersion = "0.9.3"
-    function Test-UvVersionOk {
+    # The floor before this raised it. An offline host may keep a uv between the
+    # two, since those installs worked without touching the network; below it the
+    # installer rejected the uv outright and still has to, or the install proceeds
+    # on a uv missing flags it will later be handed (--default-index,
+    # --torch-backend). Same pair as install.sh.
+    $UvOfflineMinVersion = "0.8.16"
+
+    # The version uv reports, or $null when there is no uv on PATH, it cannot be
+    # run, or it prints something unparseable. Kept separate from the comparison so
+    # the offline fallback can tell "unreadable" apart from "too old".
+    function Get-UvVersionString {
         $cmd = Get-Command uv -ErrorAction SilentlyContinue
-        if (-not $cmd) { return $false }
+        if (-not $cmd) { return $null }
         try {
             $raw = (& uv --version 2>$null | Select-Object -First 1)
         } catch {
-            return $false
+            return $null
         }
-        if ($raw -notmatch 'uv\s+([0-9]+(?:\.[0-9]+)+)') { return $false }
+        if ($raw -notmatch 'uv\s+([0-9]+(?:\.[0-9]+)+)') { return $null }
+        return $Matches[1]
+    }
+
+    function Test-UvVersionOk {
+        param([string] $Floor = $UvMinVersion)
+        $ver = Get-UvVersionString
+        if (-not $ver) { return $false }
         try {
-            return ([version]$Matches[1] -ge [version]$UvMinVersion)
+            return ([version]$ver -ge [version]$Floor)
         } catch {
             return $false
         }
@@ -1750,7 +1767,17 @@ exit 0
     # only lets the uv-managed path prefer a newer interpreter, and Windows does not
     # take that path anyway (Find-CompatiblePython hands uv a resolved --python and
     # already screens out builds that cannot import torch).
-    $UvPresentBefore = [bool](Get-Command uv -ErrorAction SilentlyContinue)
+    # Presence alone is not enough: the exception is exactly the range that used to
+    # be accepted. An unreadable version counts as present -- that shape is a uv
+    # that cannot be run for its banner, not a stale one, and failing there would
+    # break an install that worked before.
+    $UvPresentBefore = $false
+    if (Get-Command uv -ErrorAction SilentlyContinue) {
+        $UvPreviousVersion = Get-UvVersionString
+        if ((-not $UvPreviousVersion) -or (Test-UvVersionOk -Floor $UvOfflineMinVersion)) {
+            $UvPresentBefore = $true
+        }
+    }
 
     if (-not (Test-UvVersionOk)) {
         if ($UvPresentBefore) {
