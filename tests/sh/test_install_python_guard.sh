@@ -70,11 +70,13 @@ GUARD="$1"; HELPERS="$2"; VENV_DIR="$3"
 step()      { :; }
 substep()   { :; }
 tauri_log() { :; }
-make_python() {  # dir version
+make_python() {  # dir version [machine]
     mkdir -p "$1/bin"
     # The machine must match the host under test, or an Apple Silicon run would
-    # trip the Rosetta rebuild first and never reach the version recovery.
-    printf '#!/usr/bin/env bash\necho "%s %s"\n' "${FAKE_MACHINE:-x86_64}" "$2" > "$1/bin/python"
+    # trip the Rosetta rebuild first and never reach the version recovery. The
+    # third argument overrides it, for the one request that can resolve an arch
+    # the caller did not ask for.
+    printf '#!/usr/bin/env bash\necho "%s %s"\n' "${3:-${FAKE_MACHINE:-x86_64}}" "$2" > "$1/bin/python"
     chmod +x "$1/bin/python"
 }
 : > "$RECREATE_LOG"
@@ -94,9 +96,13 @@ run_install_cmd() {
                 # grammar. NO_TRIPLE_RANGE models a uv that stopped accepting it,
                 # so the bare-range retry is what has to keep 3.13 reachable.
                 case "$sel" in
-                    cpython-*) [ -n "$NO_TRIPLE_RANGE" ] && return 1 ;;
+                    cpython-*)
+                        [ -n "$NO_TRIPLE_RANGE" ] && return 1
+                        make_python "$dir" "${RECOVER_313_VERSION:-3.13.12}"; return 0 ;;
                 esac
-                make_python "$dir" "${RECOVER_313_VERSION:-3.13.12}" ;;
+                # No arch qualifier, so uv is free to satisfy it from a cached
+                # x86_64 build. BARE_RANGE_MACHINE models exactly that.
+                make_python "$dir" "${RECOVER_313_VERSION:-3.13.12}" "${BARE_RANGE_MACHINE:-}" ;;
             *3.12*)
                 [ -n "$NO_312" ] && return 1
                 make_python "$dir" "3.12.12" ;;
@@ -117,7 +123,8 @@ GUARD_RUNNER_EOF
         _rl=$(mktemp)
         env OS="$1" _ARCH="$2" _USER_PYTHON="$3" INIT_VER="$4" \
             NO_313_9="$5" NO_312="$6" FAKE_MACHINE="${7:-x86_64}" \
-            SKIP_TORCH="${8:-false}" NO_TRIPLE_RANGE="${9:-}" RECREATE_LOG="$_rl" \
+            SKIP_TORCH="${8:-false}" NO_TRIPLE_RANGE="${9:-}" \
+            BARE_RANGE_MACHINE="${10:-}" RECREATE_LOG="$_rl" \
             bash "$_GUARD_RUNNER" "$_GUARD_FILE" "$_HELPERS_FILE" "$_vd/venv"
         _rc=$?
         rm -rf "$_vd"; rm -f "$_rl"
@@ -165,6 +172,16 @@ GUARD_RUNNER_EOF
     assert_eq "Apple Silicon retries the bare range before giving up on 3.13" \
         "3.13.12 | cpython->=3.13.9,<3.14-macos-aarch64-none;>=3.13.9,<3.14" \
         "$(_run_guard macos arm64 '' 3.13.8 '' '' arm64 false 1)"
+
+    # Dropping the arch qualifier is what makes the retry possible, so the arch
+    # is what has to be re-checked. torch has shipped no macOS x86_64 wheel since
+    # 2.2.2, so a Rosetta interpreter cannot install torch at all -- strictly
+    # worse than 3.12 on arm64. The Rosetta guard runs earlier and does not run
+    # again, and the version check that follows reads only the version, so
+    # nothing else can catch this.
+    assert_eq "a bare range that resolves x86_64 is rejected for the arm64 3.12 fallback" \
+        "3.12.12 | cpython->=3.13.9,<3.14-macos-aarch64-none;>=3.13.9,<3.14;cpython-3.12-macos-aarch64-none" \
+        "$(_run_guard macos arm64 '' 3.13.8 '' '' arm64 false 1 x86_64)"
 
     # The retry is Apple-Silicon-only: everywhere else the two requests are the
     # same string, so retrying it would just be a second identical failure.
@@ -246,6 +263,12 @@ case "$2" in
                 _probe=1
                 _deadline=$(printf '%s\n' "$2" |
                     sed -n 's/.*dump_traceback_later(\([0-9]*\).*/\1/p' | head -1) ;;
+            *)
+                # No watchdog armed means an unbounded import, and it would also
+                # be running outside _torch_probe_exec. That is the shape that
+                # hangs the installer forever while merely composing an error
+                # string, so record it rather than quietly serving it.
+                echo "UNBOUNDED-IMPORT" >> "${CALL_LOG:-/dev/null}" ;;
         esac
         # A wedged GPU driver blocks the import instead of failing it. CPython's
         # watchdog is a native thread, so it fires on time even though the import
@@ -330,6 +353,15 @@ GATE_RUNNER_EOF
     assert_eq "a torch still broken after one repair fails the install" "1" "$_rc"
     assert_eq "the gate repairs exactly once, it does not loop" \
         "1" "$(grep -c . "$_GATE_CALLS")"
+
+    # This path runs every diagnostic site there is: the one before the repair
+    # and the one in the failure report. None of them may re-run a bare
+    # `import torch` to collect the message -- that would be outside both the
+    # deadline and _torch_probe_exec, so an import that only wedges without the
+    # corrected library path would hang the installer while it was composing an
+    # error string. The fake interpreter records any such call.
+    assert_eq "the failure text is collected under the same bound as the probe" \
+        "0" "$(grep -c UNBOUNDED-IMPORT "$_GATE_CALLS" || true)"
 
     # The flavor block above this one is gated on TORCH_INDEX_URL; reusing that
     # gate here would skip every path where the index is unset, macOS included.

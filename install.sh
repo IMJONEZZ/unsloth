@@ -2570,14 +2570,27 @@ if [ "$SKIP_TORCH" = false ] && [ -x "$VENV_DIR/bin/python" ]; then
                 # -- verified from 0.2.30 through 0.10.7, and it is how
                 # PythonDownloadRequest parses the string -- but it is not in the
                 # documented grammar, so this keeps the 3.13 recovery working if
-                # that ever changes. Dropping the arch qualifier risks uv
-                # satisfying the request from a cached x86_64 build, which is why
-                # it is a fallback and not the first request; landing on 3.13.9+
-                # under Rosetta is still strictly better than dropping to 3.12,
-                # and the interpreter re-probe below is what actually decides.
-                _PY_REBUILT=true
-            else
-                substep "this uv cannot provide Python 3.13.9 or newer; falling back to Python ${_PY_RECOVER_FALLBACK}"
+                # that ever changes.
+                #
+                # The arch qualifier is exactly what this request drops, so the
+                # arch is what has to be re-checked: uv can satisfy it from a
+                # cached x86_64 build. torch has shipped no macOS x86_64 wheel
+                # since 2.2.2, so a Rosetta interpreter cannot install torch at
+                # all -- worse than 3.12 on arm64, not better. The Rosetta guard
+                # above has already run and will not run again, and the check
+                # below reads only the version, so this is the only place that
+                # can catch it.
+                _bare_machine=$(_inspect_venv)
+                _bare_machine=${_bare_machine%% *}
+                if [ "$_bare_machine" = "arm64" ]; then
+                    _PY_REBUILT=true
+                else
+                    substep "the unqualified request resolved a ${_bare_machine:-unknown} Python, which has no torch wheels"
+                fi
+            fi
+
+            if [ "$_PY_REBUILT" != true ]; then
+                substep "could not get Python 3.13.9 or newer here; falling back to Python ${_PY_RECOVER_FALLBACK}"
                 if run_install_cmd "recreate venv (Python ${_PY_RECOVER_FALLBACK})" uv venv "$VENV_DIR" \
                     --python "$(_uv_python_spec "$_PY_RECOVER_FALLBACK")"; then
                     _PY_REBUILT=true
@@ -4540,27 +4553,47 @@ case "$_TORCH_IMPORT_TIMEOUT" in
     '' | *[!0-9]*) _TORCH_IMPORT_TIMEOUT=180 ;;
 esac
 
-_torch_import_probe() {
-    # A here-doc would have to be piped into python, which loses the exit status.
-    _probe_py="
-import faulthandler, sys
+# A here-doc would have to be piped into python, which loses the exit status.
+# The traceback is printed rather than swallowed so the diagnostic below can read
+# it off this same bounded run: re-running a bare `import torch` to collect the
+# message would be unbounded and would skip _torch_probe_exec, so an import that
+# wedges only without the corrected library path -- the case that wrapper exists
+# for -- would hang the installer while it was merely composing an error string.
+_torch_probe_py() {
+    printf '%s\n' "
+import faulthandler, sys, traceback
 if $_TORCH_IMPORT_TIMEOUT > 0:
     faulthandler.dump_traceback_later($_TORCH_IMPORT_TIMEOUT, exit = True)
 try:
     import torch
 except BaseException:
+    traceback.print_exc()
     sys.exit(3)
 faulthandler.cancel_dump_traceback_later()
 sys.exit(0)
 "
+}
+
+# Run the probe under every bound there is. stdout/stderr are the caller's to
+# direct: the probe discards them, the diagnostic keeps stderr.
+_torch_probe_run() {
     if command -v timeout >/dev/null 2>&1 && [ "$_TORCH_IMPORT_TIMEOUT" -gt 0 ]; then
         # Slack over the inner deadline so the watchdog is what normally fires;
         # timeout(1) only catches a hang before Python arms it.
         _torch_probe_exec timeout "$((_TORCH_IMPORT_TIMEOUT + 30))" \
-            "$_VENV_PY" -c "$_probe_py" >/dev/null 2>&1
+            "$_VENV_PY" -c "$(_torch_probe_py)"
     else
-        _torch_probe_exec "$_VENV_PY" -c "$_probe_py" >/dev/null 2>&1
+        _torch_probe_exec "$_VENV_PY" -c "$(_torch_probe_py)"
     fi
+}
+
+_torch_import_probe() {
+    _torch_probe_run >/dev/null 2>&1
+}
+
+# The failure text, collected under the same bounds and the same library path.
+_torch_import_error() {
+    _torch_probe_run 2>&1 >/dev/null || true
 }
 
 # Runs twice: once here, and once after studio setup. Setup is not a read-only
@@ -4588,7 +4621,7 @@ _torch_import_gate() {
         [ "$_TORCH_REPAIR_DONE" = false ]; then
         # Re-run only to capture the message: a healthy torch can still write to
         # stderr, so the exit status above is the test and this is the diagnosis.
-        _torch_import_err=$("$_VENV_PY" -c "import torch" 2>&1 >/dev/null || true)
+        _torch_import_err=$(_torch_import_error)
         substep "[WARN] PyTorch is installed but cannot be imported:" "$C_WARN"
         substep "[WARN]   $_torch_import_err" "$C_WARN"
         substep "reinstalling PyTorch once before giving up..."
@@ -4630,7 +4663,7 @@ _torch_import_gate() {
         # host without the VC++ redistributable looks like: `import torch` dies on
         # WinError 126 loading c10.dll until that runtime is present. Say so and
         # continue; the post-setup call is the one that decides.
-        _torch_import_err=$("$_VENV_PY" -c "import torch" 2>&1 >/dev/null || true)
+        _torch_import_err=$(_torch_import_error)
         substep "[WARN] PyTorch cannot be imported yet:" "$C_WARN"
         substep "[WARN]   $_torch_import_err" "$C_WARN"
         substep "[WARN] Studio setup installs runtime libraries torch needs, so this is" "$C_WARN"
@@ -4641,7 +4674,7 @@ _torch_import_gate() {
     if [ "$_torch_import_ok" = false ]; then
         _torch_py_ver=$("$_VENV_PY" -c \
             "import sys; print('{}.{}.{}'.format(*sys.version_info[:3]))" 2>/dev/null || echo "unknown")
-        _torch_import_err=$("$_VENV_PY" -c "import torch" 2>&1 >/dev/null || true)
+        _torch_import_err=$(_torch_import_error)
         tauri_log "ERROR" "PyTorch is installed but cannot be imported"
         step "error" "PyTorch is installed but cannot be imported" "$C_ERR"
         substep "Python:  $_torch_py_ver"
