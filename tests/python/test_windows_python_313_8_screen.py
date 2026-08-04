@@ -141,8 +141,7 @@ def test_screen_matches_only_the_broken_release(version, expected):
 @pytest.mark.parametrize(
     ("installed", "expected"),
     [
-        # The whole point: a 3.13.8 must not be selected just because 3.13 is the
-        # requested minor. Fall to the supported interpreter that does work.
+        # A 3.13.8 must not win just because 3.13 is the requested minor.
         (["3.13.8", "3.12.10"], "3.12"),
         # A healthy 3.13 is still preferred over an older minor.
         (["3.13.12", "3.12.10"], "3.13"),
@@ -157,13 +156,11 @@ def test_resolver_skips_the_broken_interpreter(installed, expected):
 
 
 # ── --no-torch must not be screened out ──
-# install.sh gates the same screen on SKIP_TORCH because the only thing wrong
-# with 3.13.8 is `import torch`, which a GGUF-only install never runs. Windows
-# has no managed-Python fallback to absorb a rejection: Find-CompatiblePython
-# feeds `uv venv` a resolved --python, so returning $null sends the run into
-# winget, then python.org, then "Python installation failed". On an offline or
-# locked-down host that is a chat-only install broken by a constraint it never
-# reaches.
+# install.sh gates the same screen on SKIP_TORCH: the only thing wrong with 3.13.8 is
+# `import torch`, which a GGUF-only install never runs. Windows has no managed-Python
+# fallback to absorb a rejection, so returning $null sends the run into winget, then
+# python.org, then "Python installation failed" -- a chat-only install broken on an
+# offline host by a constraint it never reaches.
 
 
 @pytest.mark.parametrize("version", ["3.13.8", "3.13.7", "3.12.10"])
@@ -172,12 +169,12 @@ def test_the_screen_is_inert_under_no_torch(version):
 
 
 def test_no_torch_keeps_the_only_interpreter_a_locked_down_host_has():
-    # Without the SKIP_TORCH gate this returns "none", and the caller then fails
-    # the install outright rather than building a working GGUF-only venv.
+    # Without the SKIP_TORCH gate this returns "none" and the caller fails the
+    # install rather than building a working GGUF-only venv.
     assert _pwsh(_resolver_script(["3.13.8"], skip_torch = True)) == "3.13"
 
 
 def test_a_torch_install_still_rejects_the_broken_interpreter():
-    # The gate must be scoped to --no-torch only; the #7803 screen is the whole
-    # point of this block for every install that does import torch.
+    # The gate is scoped to --no-torch only; every install that imports torch still
+    # gets the #7803 screen.
     assert _pwsh(_resolver_script(["3.13.8"], skip_torch = False)) == "none"

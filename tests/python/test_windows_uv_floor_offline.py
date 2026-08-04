@@ -63,9 +63,7 @@ def _fake_uv(tmp_path: Path, version: str | None) -> Path:
     if os.name == "nt":
         # A `#!/bin/sh` file with no extension is not executable on Windows, so
         # `uv --version` would fail and the block would read a new-enough uv as
-        # absent -- passing the test for the wrong reason on POSIX and failing it
-        # outright on the Windows leg this file is named for. PATHEXT resolves
-        # bare `uv` to `uv.cmd`.
+        # absent. PATHEXT resolves bare `uv` to `uv.cmd`.
         uv = bindir / "uv.cmd"
         uv.write_text(f"@echo off\r\necho uv {version}\r\n", encoding = "utf-8")
         return bindir

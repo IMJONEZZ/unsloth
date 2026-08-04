@@ -395,18 +395,10 @@ export function AppSidebar() {
   useEffect(() => {
     // Also while deferred: under the kill switch health settles nothing, so only a
     // first-use operation detects and a GPU host would stay chat-only until a refresh.
-    //
-    // detection_failed is deliberately NOT here, tempting as it looks. Both arms
-    // above have something that revises the verdict inside the running backend:
-    // mlx_repair calls detect_hardware() after its reinstall, and a deferred
-    // verdict leaves DEVICE unset so the next hardware-dependent call settles it.
-    // detection_failed has neither -- it sets DEVICE=CPU and DETECTION_COMPLETE,
-    // and /api/health then returns at `if DETECTION_COMPLETE.is_set() and DEVICE
-    // is not None` without ever reaching start_background_detection(). `force`
-    // only bypasses the frontend's own cache; no query param reaches the backend.
-    // Polling it would be an unending request every 15s that cannot change its
-    // own answer, so the tooltip says to restart instead, which is what the
-    // backend's own detection_failed message says too.
+    // detection_failed is deliberately excluded: unlike those two, nothing re-runs
+    // detection in the live backend (it sets DEVICE=CPU and DETECTION_COMPLETE, so
+    // /api/health short-circuits), and `force` only bypasses the frontend cache.
+    // Polling could never change the answer, hence the tooltip says to restart.
     if (!chatOnly || (chatOnlyReason !== "mlx_unavailable" && !detectionDeferred)) return;
     const id = window.setInterval(() => {
       void fetchDeviceType({ force: true }).catch(() => undefined);

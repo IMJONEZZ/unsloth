@@ -41,8 +41,7 @@ assert_contains() {
     esac
 }
 
-# The guard leans on these shipped helpers; use the real ones so the test cannot
-# drift from install.sh's own comparison and platform rules.
+# Use the real helpers so the test cannot drift from install.sh's own rules.
 _HELPERS_FILE=$(mktemp)
 {
     sed -n '/^version_ge()/,/^}/p' "$INSTALL_SH"
@@ -52,9 +51,9 @@ _HELPERS_FILE=$(mktemp)
 # ── 1. Interpreter guard ─────────────────────────────────────────────────────
 echo "=== interpreter guard: refuses a Python that cannot import torch ==="
 
-# From the shared venv probe down to just before the torch constraint block.
-# This deliberately spans both top-level guards: the Apple Silicon arch rebuild
-# and the version recovery are independent, and a venv must satisfy both.
+# From the shared venv probe to just before the torch constraint block, spanning
+# both top-level guards: the Apple Silicon arch rebuild and the version recovery
+# are independent, and a venv must satisfy both.
 _GUARD_FILE=$(mktemp)
 sed -n '/^_inspect_venv() {$/,/^# Default torch constraint/p' "$INSTALL_SH" \
     | sed '$d' > "$_GUARD_FILE"
@@ -72,10 +71,9 @@ substep()   { :; }
 tauri_log() { :; }
 make_python() {  # dir version [machine]
     mkdir -p "$1/bin"
-    # The machine must match the host under test, or an Apple Silicon run would
-    # trip the Rosetta rebuild first and never reach the version recovery. The
-    # third argument overrides it, for the one request that can resolve an arch
-    # the caller did not ask for.
+    # The machine must match the host under test, or an Apple Silicon run would trip
+    # the Rosetta rebuild first and never reach the version recovery. $3 overrides it,
+    # for the one request that can resolve an arch the caller did not ask for.
     printf '#!/usr/bin/env bash\necho "%s %s"\n' "${3:-${FAKE_MACHINE:-x86_64}}" "$2" > "$1/bin/python"
     chmod +x "$1/bin/python"
 }
@@ -86,22 +84,21 @@ run_install_cmd() {
         dir="$3"; sel=""; shift 3
         while [ $# -gt 0 ]; do [ "$1" = "--python" ] && { sel="$2"; shift; }; shift; done
         echo "$sel" >> "$RECREATE_LOG"
-        # NO_313_9 models the uv that caused this bug: a managed-Python manifest
-        # that predates 3.13.9, so only the 3.12 fallback can succeed.
+        # NO_313_9 models the uv that caused this bug: a manifest predating
+        # 3.13.9, so only the 3.12 fallback can succeed.
         case "$sel" in
             *'>=3.13.9'*)
                 [ -n "$NO_313_9" ] && return 1
-                # A PEP 440 range nested in the platform triple parses on every
-                # uv from 0.2.30 to 0.10.7, but it is not in uv's documented
-                # grammar. NO_TRIPLE_RANGE models a uv that stopped accepting it,
-                # so the bare-range retry is what has to keep 3.13 reachable.
+                # A range nested in the platform triple parses on every uv from
+                # 0.2.30 to 0.10.7 but is undocumented. NO_TRIPLE_RANGE models a uv
+                # that stopped accepting it, leaving the bare-range retry.
                 case "$sel" in
                     cpython-*)
                         [ -n "$NO_TRIPLE_RANGE" ] && return 1
                         make_python "$dir" "${RECOVER_313_VERSION:-3.13.12}"; return 0 ;;
                 esac
-                # No arch qualifier, so uv is free to satisfy it from a cached
-                # x86_64 build. BARE_RANGE_MACHINE models exactly that.
+                # No arch qualifier, so uv may satisfy it from a cached x86_64
+                # build. BARE_RANGE_MACHINE models exactly that.
                 make_python "$dir" "${RECOVER_313_VERSION:-3.13.12}" "${BARE_RANGE_MACHINE:-}" ;;
             *3.12*)
                 [ -n "$NO_312" ] && return 1
@@ -155,8 +152,7 @@ GUARD_RUNNER_EOF
         "3.14.0 | " \
         "$(_run_guard linux x86_64 '' 3.14.0 '' '')"
 
-    # --python is the one thing the user explicitly pinned, so the guard warns
-    # rather than silently overriding it -- but must not rebuild.
+    # The guard warns rather than overriding what the user pinned, but must not rebuild.
     assert_eq "--python 3.13.8 is honoured, not rebuilt over" \
         "3.13.8 | " \
         "$(_run_guard linux x86_64 3.13.8 3.13.8 '' '')"
@@ -165,34 +161,30 @@ GUARD_RUNNER_EOF
         "3.13.12 | cpython->=3.13.9,<3.14-macos-aarch64-none" \
         "$(_run_guard macos arm64 '' 3.13.8 '' '' arm64)"
 
-    # A range nested in the platform triple is undocumented, even though every uv
-    # from 0.2.30 to 0.10.7 parses it. If a uv ever stops, Apple Silicon must
-    # still land on 3.13.9+ rather than dropping a whole minor to 3.12 -- so the
+    # The nested range is undocumented, so if a uv ever stops parsing it Apple
+    # Silicon must still land on 3.13.9+ rather than dropping a whole minor: the
     # bare range is retried first, and only then the 3.12 fallback.
     assert_eq "Apple Silicon retries the bare range before giving up on 3.13" \
         "3.13.12 | cpython->=3.13.9,<3.14-macos-aarch64-none;>=3.13.9,<3.14" \
         "$(_run_guard macos arm64 '' 3.13.8 '' '' arm64 false 1)"
 
-    # Dropping the arch qualifier is what makes the retry possible, so the arch
-    # is what has to be re-checked. torch has shipped no macOS x86_64 wheel since
-    # 2.2.2, so a Rosetta interpreter cannot install torch at all -- strictly
-    # worse than 3.12 on arm64. The Rosetta guard runs earlier and does not run
-    # again, and the version check that follows reads only the version, so
-    # nothing else can catch this.
+    # The retry drops the arch qualifier, so the arch has to be re-checked: torch
+    # has shipped no macOS x86_64 wheel since 2.2.2, making Rosetta strictly worse
+    # than 3.12 on arm64. The Rosetta guard does not run again and the version check
+    # that follows reads only the version, so nothing else can catch this.
     assert_eq "a bare range that resolves x86_64 is rejected for the arm64 3.12 fallback" \
         "3.12.12 | cpython->=3.13.9,<3.14-macos-aarch64-none;>=3.13.9,<3.14;cpython-3.12-macos-aarch64-none" \
         "$(_run_guard macos arm64 '' 3.13.8 '' '' arm64 false 1 x86_64)"
 
-    # The retry is Apple-Silicon-only: everywhere else the two requests are the
-    # same string, so retrying it would just be a second identical failure.
+    # Apple-Silicon-only: elsewhere the two requests are the same string, so the
+    # retry would just be a second identical failure.
     assert_eq "Linux does not retry an identical request before falling back" \
         "3.12.12 | >=3.13.9,<3.14;3.12" \
         "$(_run_guard linux x86_64 '' 3.13.8 1 '' x86_64 false 1)"
 
-    # --no-torch never imports torch, so the one defect in these interpreters
-    # cannot bite. Rebuilding would delete a working GGUF-only venv, and on a box
-    # that can reach neither 3.13.9 nor 3.12 it would abort an install that used
-    # to succeed. Leave it exactly as found.
+    # --no-torch never imports torch, so rebuilding would delete a working GGUF-only
+    # venv, and on a box that can reach neither 3.13.9 nor 3.12 it would abort an
+    # install that used to succeed.
     assert_eq "--no-torch leaves a 3.13.8 venv alone instead of rebuilding it" \
         "3.13.8 | " \
         "$(_run_guard linux x86_64 '' 3.13.8 '' '' x86_64 true)"
@@ -206,8 +198,8 @@ GUARD_RUNNER_EOF
     assert_eq "--no-torch keeps the venv when no replacement could be fetched" \
         "3.13.8 | " "$_skip_torch_offline_out"
 
-    # Both rebuilds failing must be fatal: continuing would reproduce exactly the
-    # silent chat-only install this guard exists to prevent.
+    # Both rebuilds failing must be fatal: continuing reproduces the silent
+    # chat-only install this guard exists to prevent.
     set +e
     _both_fail_out=$(_run_guard linux x86_64 '' 3.13.8 1 1 2>/dev/null)
     _both_fail_rc=$?
@@ -236,26 +228,24 @@ else
     cat > "$_GATE_RUNNER" << 'GATE_RUNNER_EOF'
 GATE="$1"; VENV_BIN="$2"
 step()      { :; }
-# Echoed, not swallowed: the wedge case asserts on the warning text. Every other
-# gate case redirects this away and asserts on the exit code and the call log.
+# Echoed, not swallowed: the wedge case asserts on the warning text.
 substep()   { printf '%s\n' "$1"; }
 tauri_log() { :; }
-# A fake interpreter whose `import torch` succeeds only once the marker exists,
-# modelling a wheel that is present but unimportable until repaired.
+# A fake interpreter whose `import torch` succeeds only once the marker exists:
+# a wheel that is present but unimportable until repaired.
 cat > "$VENV_BIN" << 'PY_EOF'
 #!/usr/bin/env bash
 case "$2" in
     *find_spec*)
-        # Stands in for the real find_spec walk: the lib dirs this wheel would
-        # contribute, in front of whatever LD_LIBRARY_PATH was inherited.
+        # The real find_spec walk: this wheel's lib dirs, in front of whatever
+        # LD_LIBRARY_PATH was inherited.
         echo "ld-probe" >> "${LD_PROBE_LOG:-/dev/null}"
         [ -n "$FAKE_TORCH_LD_DIRS" ] || exit 1
         printf '%s\n' "${FAKE_TORCH_LD_DIRS}:${LD_LIBRARY_PATH}" ;;
     *"import torch"*)
-        # Two different scripts reach here. The gate's probe arms a faulthandler
-        # deadline and reports a raised import as exit 3; the diagnosis re-run is
-        # a bare `import torch` whose exit code nothing reads, only its stderr.
-        # Tell them apart by the watchdog line and emulate the right contract.
+        # Two scripts reach here: the gate's probe arms a faulthandler deadline and
+        # reports a raised import as exit 3, while the diagnosis re-run is a bare
+        # `import torch` whose stderr alone is read. The watchdog line tells them apart.
         _probe=""
         _deadline=""
         case "$2" in
@@ -264,17 +254,16 @@ case "$2" in
                 _deadline=$(printf '%s\n' "$2" |
                     sed -n 's/.*dump_traceback_later(\([0-9]*\).*/\1/p' | head -1) ;;
             *)
-                # No watchdog armed means an unbounded import, and it would also
-                # be running outside _torch_probe_exec. That is the shape that
-                # hangs the installer forever while merely composing an error
-                # string, so record it rather than quietly serving it.
+                # No watchdog armed means an unbounded import running outside
+                # _torch_probe_exec -- the shape that hangs the installer while
+                # merely composing an error string. Record it rather than serve it.
                 echo "UNBOUNDED-IMPORT" >> "${CALL_LOG:-/dev/null}" ;;
         esac
         # A wedged GPU driver blocks the import instead of failing it. CPython's
-        # watchdog is a native thread, so it fires on time even though the import
-        # is stuck in C holding the GIL, and _exit(1)s. Without it -- the macOS
-        # case, where timeout(1) does not exist either -- nothing bounds this.
-        # A native crash inside a CUDA/ROCm library exits 139/134, not 3.
+        # watchdog is a native thread, so it fires on time even with the import stuck
+        # in C holding the GIL, and _exit(1)s. Without it -- macOS, where timeout(1)
+        # does not exist either -- nothing bounds this. A native crash inside a
+        # CUDA/ROCm library exits 139/134, not 3.
         if [ -n "${PROBE_RC:-}" ] && [ -n "$_probe" ]; then
             printf 'simulated exit %s\n' "$PROBE_RC" >&2
             exit "$PROBE_RC"
@@ -285,10 +274,9 @@ case "$2" in
             fi
             sleep 30; exit 0
         fi
-        # A system CUDA ahead of the wheel's own libs on LD_LIBRARY_PATH is what
-        # ld.so resolves first, and the import dies on an undefined symbol.
-        # Studio's entry point corrects the ordering before importing, so a probe
-        # that does the same sees the working import Studio will see.
+        # ld.so resolves a system CUDA ahead of the wheel's own libs, and the import
+        # dies on an undefined symbol. Studio's entry point corrects the ordering, so
+        # a probe that does the same sees the working import Studio will see.
         if [ -n "$LD_BREAKS_IMPORT" ] && [ -n "$LD_LIBRARY_PATH" ]; then
             case ":$LD_LIBRARY_PATH:" in
                 ":$FAKE_TORCH_LD_DIRS:"*) ;;
@@ -320,10 +308,9 @@ run_install_cmd_retry() {
     return 0
 }
 set -e
-# Sourcing runs the advisory pass, exactly as install.sh does. GATE_MODE=advisory
-# stops there, to assert that pass cannot fail the install on its own; otherwise
-# the authoritative post-setup pass follows, which is the real sequence -- and it
-# is why the repair latch matters, since both passes see the same broken wheel.
+# Sourcing runs the advisory pass, as install.sh does. GATE_MODE=advisory stops
+# there to assert that pass cannot fail the install on its own; otherwise the
+# authoritative post-setup pass follows, which is the real sequence.
 . "$GATE"
 [ "${GATE_MODE:-final}" = "advisory" ] || _torch_import_gate final
 GATE_RUNNER_EOF
@@ -359,17 +346,14 @@ GATE_RUNNER_EOF
     assert_eq "the gate repairs exactly once, it does not loop" \
         "1" "$(grep -c . "$_GATE_CALLS")"
 
-    # This path runs every diagnostic site there is: the one before the repair
-    # and the one in the failure report. None of them may re-run a bare
-    # `import torch` to collect the message -- that would be outside both the
-    # deadline and _torch_probe_exec, so an import that only wedges without the
-    # corrected library path would hang the installer while it was composing an
-    # error string. The fake interpreter records any such call.
+    # This path runs every diagnostic site: none may re-run a bare `import torch` to
+    # collect the message, since that is outside both the deadline and
+    # _torch_probe_exec and would hang the installer while composing an error string.
     assert_eq "the failure text is collected under the same bound as the probe" \
         "0" "$(grep -c UNBOUNDED-IMPORT "$_GATE_CALLS" || true)"
 
-    # The flavor block above this one is gated on TORCH_INDEX_URL; reusing that
-    # gate here would skip every path where the index is unset, macOS included.
+    # The flavor block above is gated on TORCH_INDEX_URL; reusing that gate here
+    # would skip every path where the index is unset, macOS included.
     _run_gate false "" broken "" && _rc=0 || _rc=$?
     assert_eq "an unset TORCH_INDEX_URL still fails a broken torch" "1" "$_rc"
     assert_eq "with no index the repair uses the plain reinstall path" \
@@ -379,11 +363,9 @@ GATE_RUNNER_EOF
     assert_eq "--no-torch (SKIP_TORCH=true) skips the gate entirely" "0" "$_rc"
     assert_eq "--no-torch attempts no repair" "" "$(cat "$_GATE_CALLS")"
 
-    # A wedged driver makes `import torch` hang rather than fail. main moved
-    # _PREV_TORCH_VER off the interpreter for exactly this reason (#7706), so the
-    # gate -- which must run the import for real -- has to bound it. A timeout is
-    # not evidence that torch is broken: reinstalling cannot unwedge a driver and
-    # failing would roll back a venv that is probably fine.
+    # A wedged driver makes `import torch` hang rather than fail (#7706), so the gate
+    # has to bound it. A timeout is not evidence that torch is broken: reinstalling
+    # cannot unwedge a driver and failing would roll back a probably-fine venv.
     _run_gate_wedged() {
         _bin=$(mktemp)
         _marker=$(mktemp); rm -f "$_marker"
@@ -400,16 +382,14 @@ GATE_RUNNER_EOF
     }
 
     # An inherited LD_LIBRARY_PATH pointing at a different system CUDA shadows the
-    # wheel's bundled libs, because ld.so searches LD_LIBRARY_PATH before the
-    # DT_RUNPATH in torch's .so files. studio/backend/run.py repairs that ordering
-    # and re-execs before importing, so the host runs Studio fine; a probe without
-    # the same preparation would reinstall the identical wheel, fail again and roll
-    # back a good environment over a linker-ordering problem.
+    # wheel's bundled libs, since ld.so searches it before torch's DT_RUNPATH.
+    # studio/backend/run.py repairs that ordering before importing, so the host runs
+    # Studio fine; a probe without the same preparation would roll back a good
+    # environment over a linker-ordering problem.
     _LD_PROBE_LOG=$(mktemp)
     _run_gate_ld() {  # LD_LIBRARY_PATH torch_lib_dirs
         _bin=$(mktemp)
-        # The wheel itself is fine: the library path is the only thing that can
-        # make this import fail, so the gate's verdict is about that and nothing else.
+        # The wheel is fine, so the library path is the only thing under test.
         _marker=$(mktemp); : > "$_marker"
         : > "$_GATE_CALLS"; : > "$_LD_PROBE_LOG"
         set +e
@@ -430,9 +410,8 @@ GATE_RUNNER_EOF
     assert_eq "the library-path fix means no pointless reinstall of the same wheel" \
         "" "$(cat "$_GATE_CALLS")"
 
-    # Control: with no lib dirs to prepend the probe is the bare import again, so
-    # this case must still fail. Without it the assertion above could pass for the
-    # wrong reason (a fake interpreter that never breaks).
+    # Control: with no lib dirs to prepend this is the bare import again and must
+    # still fail, or the assertion above could pass for the wrong reason.
     _run_gate_ld "/usr/local/cuda-13/lib64" "" && _rc=0 || _rc=$?
     assert_eq "an unfixable library path still fails the install" "1" "$_rc"
 
@@ -443,12 +422,11 @@ GATE_RUNNER_EOF
         "" "$(cat "$_LD_PROBE_LOG")"
     rm -f "$_LD_PROBE_LOG"
 
-    # A fresh Windows host has no Visual C++ redistributable, so `import torch`
-    # dies on WinError 126 loading c10.dll until studio/setup.ps1's Ensure-VCRedist
-    # installs it -- after this pass. Failing here would roll the venv back over a
-    # dependency the installer was about to install for itself. Verified against
-    # the real thing: this is what turned the previously-green virgin Server Core
-    # container job red before the split.
+    # A fresh Windows host has no Visual C++ redistributable, so `import torch` dies
+    # on WinError 126 loading c10.dll until setup.ps1's Ensure-VCRedist installs it,
+    # after this pass. Failing here would roll the venv back over a dependency the
+    # installer was about to install itself, which is what turned the virgin Server
+    # Core container job red before the split.
     _GATE_OUT_FILE=$(mktemp)
     _bin=$(mktemp)
     _marker=$(mktemp); rm -f "$_marker"
@@ -473,10 +451,9 @@ GATE_RUNNER_EOF
     rm -f "$_GATE_OUT_FILE"
 
     # Only the watchdog's 1 and timeout(1)'s 124 mean "the probe never reported".
-    # A SIGSEGV or SIGABRT in a CUDA/ROCm library exits 139 or 134, and an
-    # interpreter that will not start exits 127: those are the probe saying torch
-    # is broken, and warning-and-continuing on them would commit a venv whose
-    # torch demonstrably crashed -- the silent success this gate exists to stop.
+    # A SIGSEGV/SIGABRT in a CUDA or ROCm library exits 139/134 and an interpreter
+    # that will not start exits 127: those say torch is broken, and continuing on
+    # them would commit a venv whose torch demonstrably crashed.
     _run_gate_rc() {  # exit status the probe should report
         _bin=$(mktemp); _marker=$(mktemp); rm -f "$_marker"; : > "$_GATE_CALLS"
         set +e
@@ -502,10 +479,10 @@ GATE_RUNNER_EOF
     done
 
     # The advisory pass diagnoses but must not repair: before studio setup the
-    # runtime libraries torch links against may not exist yet, and a reinstall
-    # cannot supply them. It would only spend the run's single repair -- and a
-    # full wheel refresh with it, since --reinstall-package implies
-    # --refresh-package -- on a fault Ensure-VCRedist is about to fix for free.
+    # runtime libraries torch links against may not exist yet and a reinstall cannot
+    # supply them, so it would spend the run's single repair (and the full wheel
+    # refresh with it, since --reinstall-package implies --refresh-package) on a
+    # fault Ensure-VCRedist is about to fix for free.
     _bin=$(mktemp); _marker=$(mktemp); rm -f "$_marker"; : > "$_GATE_CALLS"
     set +e
     env SKIP_TORCH=false TORCH_INDEX_URL="https://download.pytorch.org/whl/cu128" \
@@ -525,12 +502,10 @@ GATE_RUNNER_EOF
     assert_contains "a wedged import says so instead of blaming the wheel" \
         "$(cat "$_GATE_OUT_FILE")" "did not finish importing"
 
-    # The same wedge with timeout(1) removed from PATH. That is not a contrived
-    # case: timeout(1) is GNU coreutils, macOS does not ship it, and the macOS
-    # install path never pulls it in -- so this is what every Apple host runs.
-    # Before the deadline moved inside Python this hung forever here, which is
-    # the one platform where the bound was the only thing standing between a
-    # wedged driver and an installer that never returns.
+    # The same wedge with timeout(1) removed from PATH. Not contrived: timeout(1) is
+    # GNU coreutils, macOS does not ship it and the macOS install path never pulls it
+    # in, so this is what every Apple host runs. Before the deadline moved inside
+    # Python this hung forever, on the one platform where it was the only bound.
     _NOTIMEOUT_BIN=$(mktemp -d)
     for _tool in bash sh sed cat rm mktemp sleep env chmod printf grep head dirname basename date; do
         _tool_path=$(command -v "$_tool" 2>/dev/null) || continue
@@ -561,8 +536,8 @@ GATE_RUNNER_EOF
         "$(cat "$_GATE_OUT_FILE")" "did not finish importing"
     assert_eq "a wedged import without timeout(1) attempts no repair" \
         "" "$(cat "$_GATE_CALLS")"
-    # The deadline was 2s and the unbounded wedge is 30s: anything near 30 means
-    # the bound was dropped again. Generous headroom for a loaded runner.
+    # Deadline 2s, unbounded wedge 30s: anything near 30 means the bound was
+    # dropped again. Generous headroom for a loaded runner.
     if [ "$_elapsed" -lt 20 ]; then
         assert_eq "a wedged import without timeout(1) is bounded, not just survived" \
             "bounded" "bounded"
@@ -600,12 +575,10 @@ assert_contains "a stale uv after install is reported rather than silently accep
     "$(sed -n '/installing uv package manager\.\.\./,/^fi$/p' "$INSTALL_SH")" \
     'uv is still older than'
 
-# Raising the floor pulled every uv 0.8.16-0.9.2 user into the refresh path they
-# used to skip. On an air-gapped machine the download fails, and under `set -e`
-# that turned a working offline install into a hard failure. An existing-but-old
-# uv can still create a venv and the guard above still repairs a bad Python, so
-# only a machine with NO uv at all may treat this as fatal. Executed, because the
-# whole point is the exit status.
+# Raising the floor pulled every uv 0.8.16-0.9.2 user into a refresh path they used
+# to skip, where an air-gapped download failure turned a working offline install into
+# a hard failure under `set -e`. An old uv still creates venvs and the guard above
+# still repairs a bad Python, so only a machine with NO uv may treat this as fatal.
 _UVBLK=$(mktemp)
 {
     echo 'set -e'
@@ -644,10 +617,10 @@ assert_contains "offline with no uv at all explains why" \
 rm -rf "$_OFFDIR"
 rm -f "$_UVBLK"
 
-# (c) an old-but-present uv on a box with neither curl nor wget. download() exits
-# the shell outright in that case, which an `if` cannot catch, so the block has to
-# probe for a downloader before calling it. Same contract as (a): warn, continue.
-# Uses the real download() rather than the stub above, since the exit is inside it.
+# (c) an old-but-present uv with neither curl nor wget. download() exits the shell
+# outright there, which an `if` cannot catch, so the block must probe for a
+# downloader first. Same contract as (a): warn, continue. Uses the real download(),
+# since the exit is inside it.
 _UVBLK2=$(mktemp)
 {
     cat <<'STUBS'
@@ -668,8 +641,8 @@ STUBS
 _NODLDIR=$(mktemp -d)
 printf '#!/bin/sh\n[ "$1" = --version ] && echo "uv 0.9.2"\nexit 0\n' > "$_NODLDIR/uv"
 chmod +x "$_NODLDIR/uv"
-# PATH holds only the stub dir, so neither curl nor wget is resolvable. The
-# interpreter is invoked by absolute path because that PATH cannot find sh either.
+# PATH holds only the stub dir, so neither curl nor wget resolves -- nor sh, hence
+# the absolute interpreter path.
 _nodl_out=$(PATH="$_NODLDIR" HOME="$_NODLDIR" /bin/sh "$_UVBLK2" 2>&1) && _nodl_rc=0 || _nodl_rc=$?
 assert_eq "an old uv with no curl or wget still completes" "0" "$_nodl_rc"
 assert_contains "an old uv with no curl or wget reaches the rest of the install" \
@@ -688,13 +661,10 @@ rm -f "$_HELPERS_FILE"
 
 # ── the gate must also run after studio setup ──
 #
-# setup.sh is not a read-only step: install.sh calls it with SKIP_STUDIO_BASE=1,
-# which leaves _SKIP_PYTHON_DEPS false, so it runs install_python_stack and that
-# can reinstall torch (the ROCm reroute, the CUDA-ladder repairs). A gate that
-# only ran before setup could pass, watch setup replace torch with something
-# unimportable, and still commit and report success. The second call also has to
-# land before _commit_studio_venv_replacement, which drops the rollback copy:
-# after that point exiting no longer restores the user's previous environment.
+# setup.sh is not read-only: it runs install_python_stack, which can reinstall torch.
+# A gate that only ran before setup could pass, watch setup replace torch with
+# something unimportable, and still commit and report success. The second call must
+# also land before _commit_studio_venv_replacement, which drops the rollback copy.
 echo ""
 echo "=== the gate runs again after studio setup ==="
 
@@ -702,11 +672,10 @@ _GATE_CALL_LINES=$(grep -n '^_torch_import_gate \(advisory\|final\)$' "$INSTALL_
 _GATE_CALL_COUNT=$(printf '%s\n' "$_GATE_CALL_LINES" | grep -c . || true)
 assert_eq "the gate is invoked exactly twice" "2" "$_GATE_CALL_COUNT"
 
-# Which pass may fail the install is the whole point of the split: before studio
-# setup the runtime libraries torch links against are not installed yet (on
-# Windows setup.ps1's Ensure-VCRedist), so a failed import there is a not-yet,
-# not a verdict. Getting these the wrong way round would roll back a working
-# environment on any fresh host that lacks the VC++ redistributable.
+# Which pass may fail the install is the point of the split: before setup the runtime
+# libraries torch links against are not installed yet (on Windows, Ensure-VCRedist),
+# so a failed import there is a not-yet. The wrong way round rolls back a working
+# environment on any fresh host lacking the VC++ redistributable.
 assert_eq "the pre-setup pass is advisory" "1" \
     "$(grep -c '^_torch_import_gate advisory$' "$INSTALL_SH")"
 assert_eq "the post-setup pass is the authoritative one" "1" \

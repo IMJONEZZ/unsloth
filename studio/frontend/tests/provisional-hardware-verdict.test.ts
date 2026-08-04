@@ -236,11 +236,9 @@ test("a deferred verdict is recorded so the sidebar can poll out of it", async (
     /detectionDeferred: isDetectionDeferred\(data\)/,
     "the store never records that the verdict came from a deferred reply",
   );
-  // Matched as two claims joined by an elastic gap, not one literal: the guard
-  // gains a clause whenever another reason becomes recoverable, and Biome rewraps
-  // the condition across lines when it does. A literal anchor goes stale on
-  // formatting alone while the behaviour it guards is intact. The gap is bounded
-  // so dropping !detectionDeferred entirely still fails.
+  // Elastic gap rather than a literal: the guard gains clauses and Biome rewraps it,
+  // which would break a literal anchor on formatting alone. The gap stays bounded so
+  // dropping !detectionDeferred entirely still fails.
   assert.match(
     sidebar,
     /chatOnlyReason !== "mlx_unavailable"[\s\S]{0,240}?!detectionDeferred/,
@@ -248,16 +246,12 @@ test("a deferred verdict is recorded so the sidebar can poll out of it", async (
   );
 });
 
-// Both arms of that poll have something that revises the verdict inside the running
-// backend: utils/mlx_repair calls detect_hardware() after its reinstall, and a deferred
-// verdict leaves DEVICE unset so the next hardware-dependent call settles it.
-// detection_failed has neither. ensure_hardware_detected() sets DEVICE=CPU and
-// DETECTION_COMPLETE, and main._await_hardware_detection returns at
-// `if DETECTION_COMPLETE.is_set() and DEVICE is not None` without ever reaching
-// start_background_detection(). fetchDeviceType({ force: true }) only bypasses the
-// frontend's own cache -- no query param reaches the server -- so adding it here buys
-// an unending 15s request that cannot change its own answer. The tooltip has to send
-// the user to a restart instead, which is what the backend's own message does.
+// The poll's two arms are revisable in the live backend (mlx_repair re-detects; a
+// deferred verdict leaves DEVICE unset). detection_failed is not: it sets DEVICE=CPU
+// and DETECTION_COMPLETE, so _await_hardware_detection never reaches
+// start_background_detection(), and `force` only bypasses the frontend cache. Polling
+// it would be an unending 15s request that cannot change its own answer, so the hint
+// must send the user to a restart.
 test("the recovery poll does not chase a verdict the backend cannot revise", async () => {
   const { readFile } = await import("node:fs/promises");
   const sidebar = await readFile(

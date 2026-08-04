@@ -208,10 +208,8 @@ def _gate_script(
         probe_timeouts = [False] * len(probe_results)
     timeouts = ", ".join("$true" if t else "$false" for t in probe_timeouts)
     # See _probe_script: kept out of the f-string for pre-3.12 compatibility.
-    # Through the *call*, not just the function body: the gate is a function now
-    # so that it can also run after studio setup, and extracting only the
-    # definition would define it and never invoke it -- every assertion below
-    # would then pass against a gate that never ran.
+    # Through the *call*, not just the body: extracting only the definition would
+    # define the gate and never invoke it, passing every assertion below.
     gate = _extract(
         r"    # ── Refuse to finish on a torch that installed but cannot be imported ──"
         r".*?\n    \}\n\n"
@@ -286,8 +284,8 @@ def _run_gate(**kwargs) -> str:
 
 def test_healthy_torch_attempts_no_repair():
     out = _run_gate(skip_torch = False, probe_results = [True])
-    # Two probes, one per pass: the advisory one before studio setup and the
-    # authoritative one after it, since setup can reinstall torch in between.
+    # One probe per pass: advisory before studio setup, authoritative after,
+    # since setup can reinstall torch in between.
     assert "PROBES=2" in out
     assert "REPAIRS=0" in out
     assert "EXIT_FAILURE" not in out
@@ -295,9 +293,8 @@ def test_healthy_torch_attempts_no_repair():
 
 
 def test_one_repair_is_attempted_and_can_rescue_the_install():
-    # Three outcomes because the repair now lives on the authoritative pass:
-    # advisory probes and reports, the post-setup pass probes again, repairs,
-    # and re-probes. Two Falses are needed to reach the repair at all.
+    # Three outcomes because the repair lives on the authoritative pass: advisory
+    # probes, post-setup probes again, repairs, re-probes.
     out = _run_gate(skip_torch = False, probe_results = [False, False, True])
     assert "REPAIRS=1" in out
     assert "PROBES=3" in out
@@ -344,12 +341,11 @@ def test_the_failure_message_tells_the_user_what_to_do():
     assert "--no-torch" in out, "must offer the GGUF-only escape"
 
 
-# A probe that never reported anything has not shown that torch is broken. A wedged
-# GPU driver blocks `import torch` outright (#7706, why Get-InstalledTorchTag reads
-# version.py off disk), and reinstalling cannot unwedge a driver. install.sh treats
-# 124 from timeout(1) as its own verdict and leaves the install in place; Windows
-# used to fold a timeout into "cannot be imported", so the same host that gets a
-# warning on Linux had its freshly built venv deleted and restored to the old one.
+# A probe that never reported has not shown torch is broken. A wedged GPU driver
+# blocks `import torch` outright (#7706) and reinstalling cannot unwedge it, so
+# install.sh treats timeout(1)'s 124 as its own verdict and leaves the install in
+# place. Windows used to fold a timeout into "cannot be imported", deleting a
+# freshly built venv on the same host that only gets a warning on Linux.
 
 
 def test_a_timeout_does_not_fail_the_install():
@@ -362,8 +358,7 @@ def test_a_timeout_does_not_fail_the_install():
 def test_a_timeout_attempts_no_repair():
     out = _run_gate(skip_torch = False, probe_results = [False], probe_timeouts = [True])
     assert "REPAIRS=0" in out, "reinstalling cannot unwedge a driver"
-    # One probe per pass and no more: within a pass the timeout is the verdict,
-    # so nothing is re-probed and nothing is repaired.
+    # Within a pass the timeout is the verdict: nothing is re-probed or repaired.
     assert "PROBES=2" in out
 
 
@@ -399,13 +394,11 @@ def _reinstall_script(
 ) -> str:
     # See _probe_script: kept out of the f-string for pre-3.12 compatibility.
     helper = _extract(r"    function Invoke-TorchTrioReinstall \{.*?\n    \}\n")
-    # The shipped floor maps, not copies: the repair has to agree with the fresh
+    # The shipped floor maps, not copies: the repair must agree with the fresh
     # install about which companion range each arch needs.
     vision_map = _extract(r"        \$torchvisionFloorMap = @\{.*?\n        \}\n")
     audio_map = _extract(r"        \$torchaudioFloorMap = @\{.*?\n        \}\n")
-    # The repair picks the XPU spec list off the resolved index leaf, so both
-    # helpers it consults come from install.ps1 too. Stubbing them would let the
-    # XPU floor drift without a test noticing, which is the bug being covered.
+    # Real helpers too: stubbing them would let the XPU floor drift unnoticed.
     xpu_specs = _extract(r"    function Get-XpuTorchSpecs \{.*?\n    \}\n")
     leaf_name = _extract(r"    function Get-TorchIndexLeafName \{.*?\n    \}\n")
     vision_lit = f"'{pinned_vision}'" if pinned_vision else "$null"
@@ -459,14 +452,12 @@ def test_reinstall_prefers_the_rocm_index_with_pinned_companions():
 
 
 # ── The auto ROCm reroute sets a torch floor but no companion pins ──
-# $PinnedRocmVisionSpec / $PinnedRocmAudioSpec are only filled by an explicit
-# index pin. The gfx115x/gfx120x auto-route sets $ROCmTorchFloor from
-# $torchFloorMap and leaves both null, so a two-tier fallback lands on a bare
-# torchvision/torchaudio against repo.amd.com. AMD's ROCm torchvision wheels
-# declare a bare "Requires-Dist: torch", so the resolver offers no protection of
-# its own, which is why the fresh install and the flavor repair both consult the
-# floor maps. The repair must do the same or it pairs an unbounded companion with
-# the floored torch it just pinned.
+# $PinnedRocmVisionSpec / $PinnedRocmAudioSpec are only filled by an explicit index
+# pin, so the gfx115x/gfx120x auto-route leaves both null and a two-tier fallback
+# lands on a bare torchvision/torchaudio against repo.amd.com. AMD's wheels declare a
+# bare "Requires-Dist: torch", so the resolver offers no protection of its own and
+# the repair must consult the floor maps like the fresh install does, or it pairs an
+# unbounded companion with the floored torch it just pinned.
 
 
 def test_the_rocm_repair_falls_back_to_the_floor_maps_when_no_pin_was_set():
@@ -520,8 +511,8 @@ def test_reinstall_uses_the_resolved_cuda_index_when_there_is_no_rocm_one():
 
 
 def test_reinstall_still_works_when_no_index_was_resolved():
-    # Deliberately not gated on an index: a CPU-only host with none resolved must
-    # still be repairable, or the gate below it can only ever fail.
+    # Not gated on an index: a CPU-only host must still be repairable, or the
+    # gate below it can only ever fail.
     out = _pwsh(_reinstall_script(rocm_index = "", torch_index = ""))
     assert "reinstall PyTorch" in out
     assert "--default-index" not in out
@@ -529,13 +520,10 @@ def test_reinstall_still_works_when_no_index_was_resolved():
 
 
 # ── Windows on ARM has no torchaudio wheel, so the repair must not ask for one ──
-# download.pytorch.org/whl/cpu publishes win_arm64 builds of torch (21) and
-# torchvision (30) but none of torchaudio (0). uv resolves the request as a unit,
-# so leaving the pin in makes the one repair this gate allows itself fail
-# outright and reinstall nothing -- the install then fails and rolls back over a
-# wheel that was never going to exist. The repo already has
-# tests/studio/test_xpu_arm64_torchaudio.ps1 for this same drift between a fresh
-# install path and its repair twin.
+# download.pytorch.org/whl/cpu publishes win_arm64 torch and torchvision but no
+# torchaudio. uv resolves the request as a unit, so leaving the pin in makes the one
+# repair this gate allows itself reinstall nothing, then fail the install and roll
+# back over a wheel that was never going to exist.
 
 
 @pytest.mark.parametrize("torch_index", ["https://download.pytorch.org/whl/cpu", ""])
@@ -557,8 +545,8 @@ def test_the_repair_keeps_torchaudio_everywhere_else(torch_index):
 
 
 def test_the_rocm_repair_is_untouched_by_the_arm_exception():
-    # repo.amd.com publishes no win_arm64 wheels at all, so ROCm keeps its own
-    # pinned companions rather than inheriting the arm64 spec list.
+    # repo.amd.com publishes no win_arm64 wheels, so ROCm keeps its own pinned
+    # companions rather than inheriting the arm64 spec list.
     out = _pwsh(
         _reinstall_script(
             rocm_index = "https://repo.amd.com/rocm/whl/gfx1151",
@@ -592,11 +580,9 @@ def test_the_gate_runs_again_after_studio_setup_before_the_venv_is_committed():
     ]
     assert len(calls) == 2, f"expected the gate to run twice, found {len(calls)}"
 
-    # Which pass may fail the install is the point of the split. Before studio
-    # setup the Visual C++ runtime torch links against is not installed yet
-    # (setup.ps1's Ensure-VCRedist), so a failed import there is a not-yet rather
-    # than a verdict, and failing would roll the venv back over a dependency the
-    # installer was about to install for itself.
+    # Which pass may fail the install is the point of the split: before setup's
+    # Ensure-VCRedist runs, a failed import is a not-yet rather than a verdict, and
+    # failing would roll the venv back over a dependency setup is about to install.
     advisory = re.findall(r"^\s*Invoke-TorchImportGate \| Out-Null$", source, re.M)
     final = re.findall(r"^\s*Invoke-TorchImportGate -Final \| Out-Null$", source, re.M)
     assert len(advisory) == 1, "exactly one advisory pass"

@@ -20,11 +20,9 @@ function Install-UnslothStudio {
     $ErrorActionPreference = "Stop"
     $script:UnslothVerbose = ($env:UNSLOTH_VERBOSE -eq "1")
 
-    # Per installer run, not per PowerShell scope. The documented
-    # `irm ... | iex` flow can call this twice in one session, and a sentinel
-    # left $true by the first run would skip the second run's only repair and
-    # roll back a torch that a retry could have fixed. install.sh gets this for
-    # free from a top-level assignment; here it has to be explicit.
+    # Per installer run, not per scope: the documented `irm ... | iex` flow can call
+    # this twice in one session, and a sentinel left $true by the first run would
+    # skip the second run's only repair.
     $script:TorchRepairDone = $false
 
     # Same fix as studio/setup.ps1, for the same reason. This script also calls
@@ -1296,24 +1294,18 @@ exit 0
     # The resolved Path is passed to `uv venv --python` to prevent uv from
     # re-resolving the version string back to a conda interpreter.
     # CPython 3.13.8 carries gh-139783: inspect.getsourcelines() mis-parses a
-    # decorator followed by a comment, which is exactly the shape of the
-    # @_overload_method blocks torch/nn/modules/rnn.py parses at import time. The
-    # result is an IndentationError out of `import torch`, after which Studio
-    # reports no accelerator and greys out Train with no explanation (#7803).
-    # 3.13.9 was expedited a week later carrying only that fix, so the bad set is
-    # the tail of the 3.13 series below 3.13.9. Windows reaches it through an
-    # already-installed interpreter rather than uv's manifest, so the screen
-    # belongs in detection: never hand such a build to uv venv.
+    # decorator followed by a comment, exactly the shape of the @_overload_method
+    # blocks torch/nn/modules/rnn.py parses at import time, so `import torch` raises
+    # IndentationError and Studio then greys out Train unexplained (#7803). 3.13.9
+    # shipped only that fix, so the bad set is [3.13.8, 3.13.9). Windows reaches such
+    # a build through an already-installed interpreter rather than uv's manifest, so
+    # the screen belongs in detection: never hand one to uv venv.
     #
-    # Not under --no-torch, matching install.sh's SKIP_TORCH gate on the same
-    # screen: the only thing wrong with these builds is `import torch`, which a
-    # no-torch install never performs (it installs no PyTorch and the import gate
-    # skips itself). Rejecting one here does not fall back to a managed Python --
-    # Windows has no such path, Find-CompatiblePython feeds `uv venv` a resolved
-    # --python -- so an offline or locked-down host whose only interpreter is
-    # 3.13.8 leaves detection empty, tries winget and python.org, and ends at
-    # "Python installation failed". That turns a GGUF-only install that used to
-    # work into a hard failure over a constraint it never reaches.
+    # Not under --no-torch, matching install.sh's SKIP_TORCH gate: the only broken
+    # thing is `import torch`, which a no-torch install never performs. Windows has
+    # no managed-Python fallback (Find-CompatiblePython feeds uv a resolved --python),
+    # so rejecting a locked-down host's only interpreter would turn a GGUF-only
+    # install that used to work into "Python installation failed".
     function Test-PythonCannotImportTorch {
         param([string]$FullVersion)
         if ($SkipTorch) { return $false }
@@ -1628,11 +1620,9 @@ exit 0
 
     # ── Install uv ──
     Write-TauriLog "STEP" "Installing uv package manager"
-    # Kept in step with install.sh: 0.9.3 is the first uv whose managed-Python
-    # manifest carries CPython 3.13.9, the release that fixed the gh-139783 torch
-    # import failure. Windows usually hands uv an already-detected interpreter
-    # path rather than a version, but the uv-managed path exists and the two
-    # installers are expected to agree on their floor.
+    # In step with install.sh: 0.9.3 is the first uv whose managed-Python manifest
+    # carries CPython 3.13.9, the release that fixed the gh-139783 torch import
+    # failure. Windows rarely takes the uv-managed path, but the two must agree.
     $UvMinVersion = "0.9.3"
     function Test-UvVersionOk {
         $cmd = Get-Command uv -ErrorAction SilentlyContinue
@@ -1754,14 +1744,12 @@ exit 0
         return $true
     }
 
-    # Whether a failed refresh is fatal depends on what is already here, exactly as
-    # in install.sh. With no uv at all there is nothing to fall back to. With an
-    # existing but older uv it must not be: raising UvMinVersion pulled every
-    # 0.8.16-0.9.2 host into the block below, and those installs used to succeed
-    # without touching the network. The floor only exists so the uv-managed path
-    # can *prefer* a newer interpreter, and Windows does not take that path anyway
-    # -- Find-CompatiblePython hands `uv venv` a resolved --python path, and it
-    # already screens out the builds that cannot import torch.
+    # As in install.sh: with no uv there is nothing to fall back to, but an existing
+    # older uv must not be fatal -- raising UvMinVersion would otherwise fail every
+    # 0.8.16-0.9.2 host that used to install without touching the network. The floor
+    # only lets the uv-managed path prefer a newer interpreter, and Windows does not
+    # take that path anyway (Find-CompatiblePython hands uv a resolved --python and
+    # already screens out builds that cannot import torch).
     $UvPresentBefore = [bool](Get-Command uv -ErrorAction SilentlyContinue)
 
     if (-not (Test-UvVersionOk)) {
@@ -1783,12 +1771,9 @@ exit 0
         # winget unavailable or it didn't put uv on PATH: install the pinned
         # release directly (ARM64 runners, machines without the Store).
         if (-not (Test-UvVersionOk)) {
-            # $ErrorActionPreference is "Stop" here, and Install-UvFromRelease
-            # only guards its own download loop: an unwritable UV_INSTALL_DIR or
-            # an antivirus lock on uv.exe throws during extract or copy and
-            # would abort the script outright -- past the $UvPresentBefore
-            # fallback below, whose entire purpose is to keep a host that was
-            # installing fine before the floor moved.
+            # $ErrorActionPreference is "Stop" and Install-UvFromRelease only guards
+            # its own download loop, so an unwritable UV_INSTALL_DIR or a locked
+            # uv.exe would abort the script past the $UvPresentBefore fallback below.
             try { Install-UvFromRelease | Out-Null } catch {
                 substep "could not install the pinned uv release: $($_.Exception.Message)" "Yellow"
             }
@@ -1813,8 +1798,8 @@ exit 0
 
     if (-not (Test-UvVersionOk)) {
         if ($UvPresentBefore) {
-            # An old uv still creates venvs and installs wheels. Say so and carry on
-            # rather than failing a host that was installing fine before the floor moved.
+            # An old uv still creates venvs and installs wheels, so carry on rather
+            # than failing a host that installed fine before the floor moved.
             substep "[WARN] uv is older than $UvMinVersion and could not be refreshed -- continuing with the installed uv." "Yellow"
             Write-TauriLog "WARN" "uv is older than $UvMinVersion and could not be refreshed"
         } else {
@@ -2890,27 +2875,18 @@ exit 0
         return $false
     }
 
-    # Does `import torch` actually work? Returns an object with Ok and Error.
+    # Does `import torch` actually work? Returns Ok / TimedOut / Error.
     # Get-InstalledTorchTag above cannot answer this: it returns $null both for a
-    # torch that is absent and for one that raises, so the caller cannot tell a
-    # missing package from a broken interpreter.
+    # torch that is absent and for one that raises. Same ProcessStartInfo +
+    # async-drain + timeout shape as it, for the same deadlock reasons.
     #
-    # Same ProcessStartInfo + async-drain + timeout shape as Get-InstalledTorchTag,
-    # for the same deadlock reasons. install.sh probes twice, taking the exit status
-    # from one run and the message from a second, because POSIX sh cannot easily
-    # capture both at once. One run yields both here, which is observably identical
-    # and cannot report a status from one process and a message from another.
-    #
-    # TimedOut is a third verdict, not a flavour of Ok=$false, for the reason
-    # install.sh gives at its own gate: a probe that never reported anything has not
-    # shown that torch is broken. A wedged GPU driver blocks the import outright
-    # (#7706, why Get-InstalledTorchTag reads version.py off disk instead), and a
-    # first-ever load of the freshly written torch\lib + nvidia\*\lib DLLs through
-    # Defender's on-access scanner is legitimately slow. Reinstalling cannot unwedge
-    # a driver, and failing would roll a probably-fine venv back, so the caller warns
-    # and continues. 0 means "take the default": 180s to match install.sh, overridable
-    # with UNSLOTH_TORCH_IMPORT_TIMEOUT (seconds), which Windows previously had no way
-    # to reach at all.
+    # TimedOut is a third verdict, not a flavour of Ok=$false, as at install.sh's own
+    # gate: a probe that never reported has not shown torch is broken. A wedged GPU
+    # driver blocks the import outright (#7706), and a first-ever load of the freshly
+    # written torch\lib + nvidia\*\lib DLLs through Defender is legitimately slow.
+    # Reinstalling unwedges neither and failing would roll a probably-fine venv back,
+    # so the caller warns and continues. 0 means "take the default": 180s to match
+    # install.sh, overridable with UNSLOTH_TORCH_IMPORT_TIMEOUT (seconds).
     function Test-TorchImport {
         param(
             [string]$PythonExe,
@@ -2940,8 +2916,7 @@ exit 0
             $finished = $proc.WaitForExit($TimeoutMs)
             if (-not $finished) {
                 try { $proc.Kill() } catch {}
-                # Floor, not [int]: PowerShell rounds .5 to even, so [int](1500/1000)
-                # would report 2s for a 1.5s budget.
+                # Floor, not [int]: PowerShell rounds .5 to even, so a 1.5s budget would report 2s.
                 $killedAfter = [math]::Floor($TimeoutMs / 1000)
                 return [pscustomobject]@{ Ok = $false; TimedOut = $true; Error = "import torch did not finish within ${killedAfter}s" }
             }
@@ -2949,8 +2924,7 @@ exit 0
             $stderr = $errTask.GetAwaiter().GetResult().Trim()
             # Exit code is the test, not stderr: a healthy torch still warns on stderr.
             if ($proc.ExitCode -eq 0) { return [pscustomobject]@{ Ok = $true; TimedOut = $false; Error = "" } }
-            # Last non-blank line: an import failure prints a full traceback and the
-            # exception itself is the part a user can act on.
+            # Last non-blank line of the traceback: the exception is the actionable part.
             if ($stderr) {
                 $detail = ($stderr -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 1).Trim()
             } else {
@@ -2962,38 +2936,31 @@ exit 0
         }
     }
 
-    # Reinstall the torch trio through whichever index this run already resolved.
-    # Mirrors _reinstall_torch_trio in install.sh, with the extra ROCm branch the
-    # flavor block above needs: repo.amd.com pins its own companion versions, and a
-    # bare torchvision/torchaudio there resolves an ABI-incompatible build.
+    # Reinstall the torch trio through whichever index this run resolved. Mirrors
+    # _reinstall_torch_trio in install.sh, plus a ROCm branch: repo.amd.com pins its
+    # own companion versions, so a bare torchvision/torchaudio there is ABI-incompatible.
     function Invoke-TorchTrioReinstall {
         if ($ROCmIndexUrl) {
-            # Same three-tier companion fallback as the fresh ROCm install and the
-            # flavor repair, not a two-tier one. The auto gfx115x/gfx120x reroute
-            # sets $ROCmTorchFloor from $torchFloorMap but leaves $PinnedRocm*Spec
-            # null (only an explicit index pin fills those), so stopping at the pin
-            # would drop to a bare torchvision/torchaudio on repo.amd.com -- the
-            # exact thing the floor maps exist to prevent, since AMD publishes each
-            # companion independently per arch and a bare spec resolves an
-            # ABI-incompatible build next to the floored torch.
+            # Three-tier companion fallback, not two: the auto gfx115x/gfx120x reroute
+            # sets $ROCmTorchFloor but leaves $PinnedRocm*Spec null (only an explicit
+            # index pin fills those), so stopping at the pin would drop to a bare
+            # torchvision/torchaudio on repo.amd.com. AMD publishes each companion
+            # independently per arch, so that resolves an ABI-incompatible build.
             $rocmSpec = if ($ROCmTorchFloor) { $ROCmTorchFloor } else { "torch" }
             $visionSpec = if ($PinnedRocmVisionSpec) { $PinnedRocmVisionSpec } elseif ($ROCmGfxArch -and $torchvisionFloorMap -and $torchvisionFloorMap.ContainsKey($ROCmGfxArch)) { $torchvisionFloorMap[$ROCmGfxArch] } else { "torchvision" }
             $audioSpec = if ($PinnedRocmAudioSpec) { $PinnedRocmAudioSpec } elseif ($ROCmGfxArch -and $torchaudioFloorMap -and $torchaudioFloorMap.ContainsKey($ROCmGfxArch)) { $torchaudioFloorMap[$ROCmGfxArch] } else { "torchaudio" }
             return Invoke-InstallCommandRetry -Label "reinstall PyTorch (ROCm)" -Command { uv pip install --python $VenvPython --force-reinstall --default-index $ROCmIndexUrl $rocmSpec $visionSpec $audioSpec }
         }
-        # Same win_arm64 exception the fresh install makes above (whl/cpu carries
-        # torch and torchvision for win_arm64 but no torchaudio at all). Asking for
-        # it here does not degrade to a partial repair: uv resolves the request as a
-        # unit, so the one repair this gate allows itself would fail outright and
-        # reinstall nothing, then fail the install and roll the venv back over a
-        # wheel that does not exist. The --reinstall-package flags stay as they are;
-        # naming a package outside the resolution is a no-op. ROCm is x64-only on
-        # Windows (repo.amd.com publishes no win_arm64), so that branch is unchanged.
-        # XPU keeps its own floor. unsloth/models/_utils.py rejects XPU torch
-        # below 2.6, so a generic ">=2.4" can resolve a 2.5 wheel off an XPU
-        # mirror that imports cleanly, passes this gate, and then fails the
-        # moment Unsloth initializes the device. The fresh install and the
-        # flavor repair both use Get-XpuTorchSpecs for exactly this reason.
+        # Same win_arm64 exception as the fresh install above (whl/cpu has no
+        # torchaudio for win_arm64). Asking for it would not degrade to a partial
+        # repair: uv resolves as a unit, so the one repair this gate allows itself
+        # would install nothing, fail the install, and roll the venv back over a wheel
+        # that does not exist. --reinstall-package flags stay: naming a package
+        # outside the resolution is a no-op. (ROCm is x64-only on Windows, so its
+        # branch above is unaffected.) XPU keeps its own floor because
+        # unsloth/models/_utils.py rejects XPU torch below 2.6, so a generic ">=2.4"
+        # could resolve a 2.5 wheel that imports cleanly, passes this gate, and then
+        # fails the moment Unsloth initializes the device.
         if ($TorchIndexUrl -and (Get-TorchIndexLeafName $TorchIndexUrl) -eq "xpu") {
             $_repairSpecs = Get-XpuTorchSpecs -Platform (Get-VenvPlatformTag -PythonExe $VenvPython)
         } else {
@@ -3005,8 +2972,7 @@ exit 0
         if ($TorchIndexUrl) {
             return Invoke-InstallCommandRetry -Label "reinstall PyTorch" -Command { uv pip install --python $VenvPython @_repairSpecs --default-index $TorchIndexUrl --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio }
         }
-        # No index resolved. Still repairable: a plain resolve is what a CPU-only
-        # host would have installed in the first place.
+        # No index resolved: a plain resolve is what a CPU-only host would have installed.
         return Invoke-InstallCommandRetry -Label "reinstall PyTorch" -Command { uv pip install --python $VenvPython @_repairSpecs --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio }
     }
 
@@ -3469,61 +3435,53 @@ exit 0
     }
 
     # ── Refuse to finish on a torch that installed but cannot be imported ──
-    # Get-InstalledTorchTag returns $null for a torch that raises on import exactly
-    # as it does for one that is absent, so an interpreter-level ImportError (a
-    # CPython patch carrying gh-139783, a half-written wheel, an unresolved CUDA
-    # DLL) skips both flavor branches above and the installer reports success.
-    # Studio then sets CHAT_ONLY_REASON=detection_failed and greys out Train, which
-    # is how #7803 stayed invisible on a working 2-GPU box. Import it once for real.
+    # Get-InstalledTorchTag returns $null for a torch that raises on import exactly as
+    # for one that is absent, so an interpreter-level ImportError (gh-139783, a
+    # half-written wheel, an unresolved CUDA DLL) skips both flavor branches above and
+    # the installer reports success while Studio sets detection_failed and greys out
+    # Train -- how #7803 stayed invisible on a working 2-GPU box. Import it for real.
+    # Repair once, because a truncated wheel is worth exactly one retry, then fail:
+    # Exit-InstallFailure rolls back to the previous working install.
     #
-    # Repair once, because a truncated wheel is worth exactly one retry, then fail.
-    # Exit-InstallFailure runs Restore-StudioVenvRollback, so a failed upgrade leaves
-    # the previous working install rather than a broken one.
+    # Not gated on $TorchIndexUrl the way the flavor block is: that gate identifies a
+    # GPU wheel family, and reusing it would skip every path where no index resolved
+    # while torch is still expected.
     #
-    # Deliberately not gated on $TorchIndexUrl the way the flavor block above is:
-    # that gate exists to identify a GPU wheel family, and reusing it here would skip
-    # every path where no index was resolved while torch is still expected.
+    # Called twice: here, and again after studio setup, which is not read-only
+    # (setup.ps1 runs its own PyTorch pass), so this probe is not the venv's final
+    # state. Without the second call setup could replace a good torch with a broken
+    # one and the installer would still commit and report success.
     #
-    # Called twice: here, and again after studio setup. Setup is not read-only --
-    # studio/setup.ps1 leaves $SkipPythonDeps false under SKIP_STUDIO_BASE=1 and
-    # runs its own PyTorch pass (install_python_stack.py reinstalls torch on the
-    # ROCm reroute and the CUDA-ladder repairs), so this probe is not the final
-    # state of the venv. Without the second call the installer could verify a good
-    # torch, let setup replace it with a broken one, and still commit and report
-    # success.
-    #
-    # The verdict travels in $script:TorchGateFailure rather than as a return
-    # value, and every call site pipes to Out-Null. A PowerShell function returns
-    # its entire success stream, so anything that writes to it -- a substep that
-    # used Write-Output, a stray uncaptured expression -- would come back as a
-    # non-null "result" and abort a perfectly good install.
+    # The verdict travels in $script:TorchGateFailure rather than as a return value,
+    # and every call site pipes to Out-Null: a PowerShell function returns its entire
+    # success stream, so any stray output would come back as a non-null "result" and
+    # abort a perfectly good install.
     function Invoke-TorchImportGate {
         param([switch]$Final)
         $script:TorchGateFailure = $null
         if ($SkipTorch) { return }
         $torchImport = Test-TorchImport -PythonExe $VenvPython
-        # Repair only on the authoritative pass. Before studio setup the Visual
-        # C++ runtime torch links against may not be installed yet, and
-        # reinstalling the trio cannot supply it: on a fresh Windows host the
-        # advisory pass would burn the run's single repair -- a full refresh of
-        # every wheel, since --reinstall-package implies --refresh-package -- on
-        # a WinError 126 that Ensure-VCRedist is about to fix for free.
+        # Repair only on the authoritative pass: before studio setup the Visual C++
+        # runtime torch links against may be missing and reinstalling the trio cannot
+        # supply it, so the advisory pass would burn the run's single repair (a full
+        # refresh of every wheel, since --reinstall-package implies --refresh-package)
+        # on a WinError 126 that Ensure-VCRedist is about to fix for free.
         if ($Final -and -not $torchImport.Ok -and -not $torchImport.TimedOut `
                 -and -not $script:TorchRepairDone) {
             substep "[WARN] PyTorch is installed but cannot be imported:" "Yellow"
             substep "[WARN]   $($torchImport.Error)" "Yellow"
             substep "reinstalling PyTorch once before giving up..."
-            # At most one reinstall per run, not one per gate: the gate runs twice
-            # and a wheel that survived the first repair will not be fixed by a second.
+            # One reinstall per run, not per gate: the gate runs twice, and a wheel that
+            # survived the first repair will not be fixed by a second.
             $script:TorchRepairDone = $true
-            # The re-probe is the verdict, not this exit code: a reinstall can report
-            # failure over a retried network hiccup and still leave torch importable.
+            # The re-probe is the verdict: a reinstall can report failure over a
+            # retried network hiccup and still leave torch importable.
             [void](Invoke-TorchTrioReinstall)
             $torchImport = Test-TorchImport -PythonExe $VenvPython
         }
         if ($torchImport.TimedOut) {
-            # Same verdict as install.sh: the import never reported anything, so we
-            # have not learned that torch is broken. Leave the install in place.
+            # Same verdict as install.sh: the import never reported, so nothing shows
+            # torch is broken. Leave the install in place.
             substep "[WARN] PyTorch did not finish importing in time." "Yellow"
             substep "[WARN] That usually means a wedged GPU driver rather than a bad install," "Yellow"
             substep "[WARN] so the install is being left in place. If Train is unavailable," "Yellow"
@@ -3531,14 +3489,11 @@ exit 0
             Write-TauriLog "WARN" "PyTorch import timed out; leaving the install in place"
         }
         elseif (-not $torchImport.Ok -and -not $Final) {
-            # Not a verdict yet. studio/setup.ps1 calls Ensure-VCRedist, whose own
-            # comment is "the prebuilt llama.cpp and PyTorch need it", and it has
-            # not run at this point. Failing here would roll the venv back over a
-            # dependency the installer was about to install for itself: on a fresh
-            # Windows host without the VC++ redistributable `import torch` dies on
-            # WinError 126 loading c10.dll until that runtime is present, which is
-            # exactly what a Server Core container reproduces. Say so and continue;
-            # the post-setup call is the one that decides.
+            # Not a verdict yet: studio/setup.ps1 calls Ensure-VCRedist and has not run.
+            # Without that runtime `import torch` dies on WinError 126 loading c10.dll
+            # (what a Server Core container reproduces), so failing here would roll the
+            # venv back over a dependency the installer is about to install itself.
+            # Say so and continue; the post-setup call decides.
             substep "[WARN] PyTorch cannot be imported yet:" "Yellow"
             substep "[WARN]   $($torchImport.Error)" "Yellow"
             substep "[WARN] Studio setup installs the Visual C++ runtime torch needs, so this" "Yellow"
@@ -3560,8 +3515,8 @@ exit 0
         }
     }
 
-    # Advisory: diagnoses and repairs, but cannot fail the install, because studio
-    # setup has not yet installed the Visual C++ runtime torch links against.
+    # Advisory: diagnoses but cannot fail the install, because studio setup has not
+    # yet installed the Visual C++ runtime torch links against.
     Invoke-TorchImportGate | Out-Null
     if ($null -ne $script:TorchGateFailure) { return $script:TorchGateFailure }
 
@@ -3766,12 +3721,11 @@ exit 0
     }
     Refresh-SessionPath  # sync current session with registry
 
-    # Setup succeeded, and it both installs Python dependencies of its own (it can
-    # reinstall torch on the way through) and installs the Visual C++ runtime torch
-    # links against. So this is the first point where a failed import is actually
-    # the installer's verdict rather than a not-yet -- and the last point where
-    # failing still restores the previous environment, since
-    # Complete-StudioVenvRollback below drops that copy.
+    # Setup succeeded, and it both reinstalls torch on the way through and installs
+    # the Visual C++ runtime torch links against. So this is the first point where a
+    # failed import is a verdict rather than a not-yet, and the last where failing
+    # still restores the previous environment, since Complete-StudioVenvRollback
+    # below drops that copy.
     Invoke-TorchImportGate -Final | Out-Null
     if ($null -ne $script:TorchGateFailure) { return $script:TorchGateFailure }
 

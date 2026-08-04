@@ -2209,13 +2209,11 @@ esac
 # ── Install uv ──
 tauri_log "STEP" "Installing uv package manager"
 # 0.9.3 is the first uv whose managed-Python manifest contains CPython 3.13.9.
-# Anything older tops out at 3.13.8, which cannot import torch: CPython
-# gh-139783 makes inspect.getsourcelines() mis-parse a decorator followed by a
-# comment, and torch/nn/modules/rnn.py has that exact shape in the
-# @_overload_method blocks it parses at import time. A bare "3.13" request on an
-# older uv therefore resolves straight to the broken patch, which is why this
-# floor -- not the interpreter guard below -- is the actual fix; the guard only
-# repairs a venv that still slipped through.
+# Anything older tops out at 3.13.8, which cannot import torch (gh-139783 makes
+# inspect.getsourcelines() mis-parse the decorator-plus-comment shape that
+# torch/nn/modules/rnn.py parses at import time), so a bare "3.13" request on an
+# older uv resolves straight to the broken patch. This floor is the actual fix; the
+# interpreter guard below only repairs a venv that still slipped through.
 UV_MIN_VERSION="0.9.3"
 
 # When bytecode compilation is enabled, large installs can exceed uv's 60s default on slow machines. Default to 180s, preserving overrides ("0" disables).
@@ -2283,13 +2281,11 @@ _uv_version_ok() {
     return 0
 }
 
-# uv interpreter request for the version or version range in $1. Apple Silicon
-# needs the arch-explicit triple or uv can satisfy the request from a cached
-# x86_64 (Rosetta) build, and torch has shipped no macOS x86_64 wheels since
-# 2.2.2. Every other platform takes the request bare so uv resolves its own
-# native download -- the macOS triple must never leak onto Linux. uv parses a
-# PEP 440 specifier in either shape, so "cpython->=3.13.9,<3.14-macos-aarch64-none"
-# resolves the same interpreter as ">=3.13.9,<3.14".
+# uv interpreter request for the version or range in $1. Apple Silicon needs the
+# arch-explicit triple or uv can satisfy the request from a cached x86_64 (Rosetta)
+# build, and torch has shipped no macOS x86_64 wheels since 2.2.2. Every other
+# platform takes it bare so uv resolves its own native download -- the macOS triple
+# must never leak onto Linux. uv parses a PEP 440 specifier in either shape.
 _uv_python_spec() {
     if [ "$OS" = "macos" ] && [ "$_ARCH" = "arm64" ]; then
         echo "cpython-$1-macos-aarch64-none"
@@ -2299,23 +2295,20 @@ _uv_python_spec() {
 }
 
 if ! command -v uv >/dev/null 2>&1 || ! _uv_version_ok uv; then
-    # Whether a failed refresh is fatal depends on what is already here. With no
-    # uv at all there is nothing to fall back to, so a download failure has to
-    # stop the install. With an existing but older uv it must not: raising
+    # With no uv at all there is nothing to fall back to, so a download failure has
+    # to stop the install. With an existing but older uv it must not: raising
     # UV_MIN_VERSION pulled every 0.8.16-0.9.2 user into this block, and those
-    # installs used to succeed without touching the network. An old uv can still
-    # create a venv, and the interpreter guard below repairs a bad Python via the
-    # 3.12 fallback, so an air-gapped box keeps working instead of being broken
-    # by a floor that only exists to *prefer* a newer interpreter.
+    # installs used to succeed without touching the network. An old uv still creates
+    # venvs and the interpreter guard below repairs a bad Python via the 3.12
+    # fallback, so an air-gapped box keeps working.
     _uv_present_before=false
     command -v uv >/dev/null 2>&1 && _uv_present_before=true
 
     substep "installing uv package manager..."
     _uv_refreshed=true
     # download() exits the shell outright when neither curl nor wget is present,
-    # which an `if` cannot catch, so probe first. Otherwise a minimal image that
-    # has uv copied in but no downloader would abort here -- an install that
-    # worked before the floor was raised.
+    # which an `if` cannot catch, so probe first: otherwise a minimal image with uv
+    # copied in but no downloader would abort an install that worked before.
     if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; then
         _uv_tmp=$(mktemp)
         if download "https://astral.sh/uv/install.sh" "$_uv_tmp"; then
@@ -2338,9 +2331,9 @@ if ! command -v uv >/dev/null 2>&1 || ! _uv_version_ok uv; then
     fi
     export PATH="$HOME/.local/bin:$PATH"
     # Astral's installer can exit 0 and still leave an older uv first on PATH (a
-    # distro package, a shell alias, a read-only ~/.local/bin). Say so here: the
-    # venv guard below still repairs the result, but the guard firing should not
-    # be the first hint that uv is too old to resolve a Python that imports torch.
+    # distro package, a shell alias, a read-only ~/.local/bin). The venv guard below
+    # repairs the result, but it firing should not be the first hint that uv is too
+    # old to resolve a Python that imports torch.
     if ! _uv_version_ok uv; then
         substep "[WARN] uv is still older than $UV_MIN_VERSION -- Python $PYTHON_VERSION may resolve to a release that cannot import torch" "$C_WARN"
     fi
@@ -2437,11 +2430,11 @@ fi
 if [ ! -x "$VENV_DIR/bin/python" ]; then
     step "venv" "creating Python ${PYTHON_VERSION} virtual environment"
     substep "$VENV_DIR"
-    # _uv_python_spec keeps the Apple Silicon arch-explicit form, so uv cannot
-    # reuse a cached x86_64 (Rosetta) build for which no torch wheel exists,
-    # without leaking that triple onto other platforms. The arm64 guard below is
-    # kept as a backstop for migrated / pre-existing venvs. An explicit --python
-    # is passed through verbatim; the interpreter guard below still inspects it.
+    # _uv_python_spec keeps the Apple Silicon arch-explicit form, so uv cannot reuse
+    # a cached x86_64 (Rosetta) build for which no torch wheel exists, without
+    # leaking that triple onto other platforms. The arm64 guard below backstops
+    # migrated / pre-existing venvs. An explicit --python passes through verbatim;
+    # the interpreter guard below still inspects it.
     if [ -z "$_USER_PYTHON" ]; then
         run_install_cmd "create venv" uv venv "$VENV_DIR" \
             --python "$(_uv_python_spec "$PYTHON_VERSION")"
@@ -2463,17 +2456,15 @@ _inspect_venv() {
         2>/dev/null || echo " "
 }
 
-# Apple Silicon only: uv may create the venv from a cached x86_64 (Rosetta)
-# Python when a same-version x86_64 build is already cached (often because uv
-# itself is an x86_64 build). That venv reports x86_64 to wheel resolvers, and
-# PyTorch ships no macOS wheels on the CPU index for any architecture, so the
-# torch install can never resolve. Recreate it with an arch-explicit arm64
-# CPython. Skip when the user explicitly chose an interpreter via --python.
+# Apple Silicon only: uv may create the venv from a cached x86_64 (Rosetta) Python
+# when a same-version x86_64 build is already cached (often because uv itself is an
+# x86_64 build). That venv reports x86_64 to wheel resolvers, and PyTorch ships no
+# macOS wheels on the CPU index for any architecture, so the torch install can never
+# resolve. Recreate it with an arch-explicit arm64 CPython. Skipped under --python.
 #
-# The interpreter-version guard below is a separate block rather than an elif:
-# a venv can be x86_64 and, once recreated, still land on a Python that cannot
-# import torch, so both invariants must hold on whatever venv we end up with.
-# That guard re-probes for itself, so this one no longer has to.
+# The interpreter-version guard below is a separate block rather than an elif: a
+# venv can be x86_64 and, once recreated, still land on a Python that cannot import
+# torch. That guard re-probes for itself, so this one no longer has to.
 if [ -z "$_USER_PYTHON" ] && [ "$OS" = "macos" ] && [ "$_ARCH" = "arm64" ]; then
     _info=$(_inspect_venv)
     _VENV_ARCH=${_info%% *}
@@ -2506,28 +2497,25 @@ if [ -z "$_USER_PYTHON" ] && [ "$OS" = "macos" ] && [ "$_ARCH" = "arm64" ]; then
 fi
 
 # Every platform: refuse to continue on an interpreter that cannot import torch.
-# CPython 3.13.8 carries gh-139783, which makes inspect.getsourcelines()
-# mis-parse a decorator followed by a comment. torch/nn/modules/rnn.py has that
-# exact shape in the @_overload_method blocks it parses at import time, so
-# `import torch` dies with an IndentationError, Studio finds no accelerator and
-# greys out Train with no explanation (#7803). 3.13.9 was expedited a week later
-# carrying only that fix, so the bad set is the tail of the 3.13 series below
-# 3.13.9. The bounds are named and compared as a range so a future bad patch is
-# a one-line change rather than another exact-string equality to bolt on.
+# CPython 3.13.8 carries gh-139783, which makes inspect.getsourcelines() mis-parse a
+# decorator followed by a comment -- the exact shape of the @_overload_method blocks
+# torch/nn/modules/rnn.py parses at import time -- so `import torch` dies with an
+# IndentationError and Studio greys out Train unexplained (#7803). 3.13.9 shipped
+# only that fix, so the bad set is [3.13.8, 3.13.9), named as a range so a future
+# bad patch is a one-line change rather than another exact-string equality.
 #
-# Skipped under SKIP_TORCH (--no-torch, Intel Mac): the only thing wrong with
-# these interpreters is `import torch`, which such an install never performs.
-# Rebuilding anyway deletes a working GGUF-only venv to chase a constraint that
-# does not apply, and on a host that cannot reach 3.13.9 or 3.12 -- an air-gapped
-# box, the case the uv floor above is careful to keep working -- it turns a
+# Skipped under SKIP_TORCH (--no-torch, Intel Mac): the only thing wrong with these
+# interpreters is `import torch`, which such an install never performs. Rebuilding
+# anyway deletes a working GGUF-only venv, and on a host that cannot reach 3.13.9 or
+# 3.12 -- air-gapped, the case the uv floor above keeps working -- it turns a
 # chat-only install that used to succeed into a hard failure.
 _PY_BAD_FLOOR="3.13.8"
 _PY_BAD_CEIL="3.13.9"
 _PY_RECOVER_PRIMARY=">=3.13.9,<3.14"
 _PY_RECOVER_FALLBACK="3.12"
 
-# $1 is the X.Y.Z from _inspect_venv. An interpreter that would not run yields an
-# empty string, which the callers above already have better signals for.
+# $1 is the X.Y.Z from _inspect_venv; an unrunnable interpreter yields an empty
+# string, which the callers above already have better signals for.
 _python_cannot_import_torch() {
     case "$1" in
         ''|*[!0-9.]*) return 1 ;;
@@ -2546,18 +2534,17 @@ if [ "$SKIP_TORCH" = false ] && [ -x "$VENV_DIR/bin/python" ]; then
     _PY_VER=${_info##* }
     if _python_cannot_import_torch "$_PY_VER"; then
         if [ -n "$_USER_PYTHON" ]; then
-            # Honour --python rather than silently overriding the one thing the
-            # user asked us to pin, but do not let the install look healthy.
+            # Honour --python rather than overriding the one thing the user pinned,
+            # but do not let the install look healthy.
             substep "[WARN] Python $_PY_VER cannot import torch (CPython gh-139783)." "$C_WARN"
             substep "[WARN] Re-run without --python, or with --python 3.12, for a usable install." "$C_WARN"
         else
             echo "  WARNING: Python $_PY_VER cannot import torch (CPython gh-139783)."
             echo "  Recreating venv with Python ${_PY_RECOVER_PRIMARY}..."
             rm -rf "$VENV_DIR"
-            # Each attempt sits in an `if` so set -e cannot abort before the
-            # fallback runs. Staying inside 3.13 is preferred because that is
-            # where the fix landed; 3.12 is only for a uv whose managed-Python
-            # manifest predates 3.13.9 and so cannot resolve the range at all.
+            # Each attempt sits in an `if` so set -e cannot abort before the fallback
+            # runs. 3.13 is preferred because that is where the fix landed; 3.12 is
+            # only for a uv whose manifest predates 3.13.9 and cannot resolve the range.
             _PY_REBUILT=false
             if run_install_cmd "recreate venv (Python ${_PY_RECOVER_PRIMARY})" uv venv "$VENV_DIR" \
                 --python "$(_uv_python_spec "$_PY_RECOVER_PRIMARY")"; then
@@ -2565,20 +2552,16 @@ if [ "$SKIP_TORCH" = false ] && [ -x "$VENV_DIR/bin/python" ]; then
             elif [ "$(_uv_python_spec "$_PY_RECOVER_PRIMARY")" != "$_PY_RECOVER_PRIMARY" ] &&
                 run_install_cmd "recreate venv (Python ${_PY_RECOVER_PRIMARY}, no arch qualifier)" \
                     uv venv "$VENV_DIR" --python "$_PY_RECOVER_PRIMARY"; then
-                # Apple Silicon only, and only reachable if the combined form is
-                # rejected. uv does parse a specifier inside the platform triple
-                # -- verified from 0.2.30 through 0.10.7, and it is how
-                # PythonDownloadRequest parses the string -- but it is not in the
-                # documented grammar, so this keeps the 3.13 recovery working if
-                # that ever changes.
+                # Apple Silicon only, and only if the combined form is rejected. uv
+                # does parse a specifier inside the platform triple (verified 0.2.30
+                # through 0.10.7) but that is not documented grammar, so this keeps
+                # the 3.13 recovery working if it ever changes.
                 #
-                # The arch qualifier is exactly what this request drops, so the
-                # arch is what has to be re-checked: uv can satisfy it from a
-                # cached x86_64 build. torch has shipped no macOS x86_64 wheel
-                # since 2.2.2, so a Rosetta interpreter cannot install torch at
-                # all -- worse than 3.12 on arm64, not better. The Rosetta guard
-                # above has already run and will not run again, and the check
-                # below reads only the version, so this is the only place that
+                # This request drops the arch qualifier, so the arch has to be
+                # re-checked: uv can satisfy it from a cached x86_64 build, and torch
+                # has shipped no macOS x86_64 wheel since 2.2.2, which is worse than
+                # 3.12 on arm64. The Rosetta guard above will not run again and the
+                # check below reads only the version, so this is the only place that
                 # can catch it.
                 _bare_machine=$(_inspect_venv)
                 _bare_machine=${_bare_machine%% *}
@@ -2600,8 +2583,8 @@ if [ "$SKIP_TORCH" = false ] && [ -x "$VENV_DIR/bin/python" ]; then
                 : > "$VENV_DIR/.unsloth-studio-owned" 2>/dev/null || true
             fi
             # Trust the interpreter, not the request: uv can satisfy a range from
-            # somewhere unexpected, and continuing on a still-broken Python would
-            # recreate the silent chat-only install this guard exists to prevent.
+            # somewhere unexpected, and a still-broken Python would recreate the
+            # silent chat-only install this guard exists to prevent.
             _info=$(_inspect_venv)
             _PY_VER=${_info##* }
             if [ "$_PY_REBUILT" != true ] || _python_cannot_import_torch "$_PY_VER"; then
@@ -2611,8 +2594,7 @@ if [ "$SKIP_TORCH" = false ] && [ -x "$VENV_DIR/bin/python" ]; then
                 substep "Upgrade uv (>= $UV_MIN_VERSION) and re-run, or pick an interpreter with --python."
                 exit 1
             fi
-            # Keep the recorded version in step with the interpreter actually in
-            # place; the Tauri diag marker and later messages both read it.
+            # The Tauri diag marker and later messages read this, so keep it in step.
             PYTHON_VERSION="$_PY_VER"
         fi
     fi
@@ -4443,20 +4425,19 @@ fi
 
 # ── Refuse to finish on a torch that installed but cannot be imported ──
 # Every torch probe above reads the version through `2>/dev/null || true`, so an
-# interpreter-level ImportError (a CPython patch with gh-139783, a half-written
-# wheel, an unresolved CUDA .so) is indistinguishable from "torch is absent":
-# _installed_torch_ver comes back empty, both flavor branches skip themselves,
-# and the installer prints nothing and exits 0. Studio then reports
-# CHAT_ONLY_REASON=detection_failed and greys out Train, which is how #7803
-# stayed invisible on a working 2-GPU box. Import it once for real.
+# interpreter-level ImportError (gh-139783, a half-written wheel, an unresolved CUDA
+# .so) is indistinguishable from "torch is absent": _installed_torch_ver comes back
+# empty, both flavor branches skip themselves, and the installer exits 0 while Studio
+# reports detection_failed and greys out Train -- how #7803 stayed invisible on a
+# working 2-GPU box. Import it once for real.
 #
-# Repair once, because a truncated wheel is worth exactly one retry, then fail.
-# The non-zero exit reaches _on_install_exit, which restores the environment this
-# run moved aside, so a failed upgrade leaves the previous working install.
+# Repair once, because a truncated wheel is worth exactly one retry, then fail: the
+# non-zero exit reaches _on_install_exit, which restores the environment this run
+# moved aside, so a failed upgrade leaves the previous working install.
 #
-# Deliberately not gated on TORCH_INDEX_URL the way the flavor block above is:
-# that gate exists to identify a GPU wheel family, and reusing it here would skip
-# every path where the index is unset while torch is still expected.
+# Not gated on TORCH_INDEX_URL the way the flavor block is: that gate identifies a
+# GPU wheel family, and reusing it would skip every path where the index is unset
+# while torch is still expected.
 _reinstall_torch_trio() {
     if [ -n "${TORCH_INDEX_URL:-}" ]; then
         _install_torch_default_index \
@@ -4468,19 +4449,15 @@ _reinstall_torch_trio() {
     fi
 }
 
-# Probe the import Studio will actually run, not a barer one. On Linux the
-# dynamic linker searches LD_LIBRARY_PATH *before* the DT_RUNPATH baked into
-# torch's .so files (ld.so(8) search order), so an inherited LD_LIBRARY_PATH
-# pointing at a different system CUDA -- a conda env, an nvidia/cuda Docker base
-# image -- shadows the wheel's own bundled libs and `import torch` dies with an
-# undefined-symbol error. studio/backend/run.py repairs exactly that at the entry
-# point (_fix_torch_cuda_ld_path + a single re-exec) before importing torch, so
-# such a host runs Studio fine. A probe without the same preparation would call
-# that install broken, reinstall the identical wheel, fail again and exit 1 --
-# rolling the environment back over a linker-ordering problem the wheel cannot
-# fix. Compute the same ordering once (find_spec only, no torch import) and run
-# every probe under it. Stays empty when there is nothing to correct, which is
-# the usual case, and the probes then exec unchanged.
+# Probe the import Studio will actually run, not a barer one. On Linux the dynamic
+# linker searches LD_LIBRARY_PATH before the DT_RUNPATH baked into torch's .so files,
+# so an inherited LD_LIBRARY_PATH pointing at a different system CUDA (a conda env,
+# an nvidia/cuda Docker base) shadows the wheel's bundled libs and `import torch`
+# dies on an undefined symbol. studio/backend/run.py repairs exactly that before
+# importing torch, so such a host runs Studio fine; a probe without the same
+# preparation would call the install broken and roll the environment back over a
+# linker-ordering problem the wheel cannot fix. Compute the same ordering once
+# (find_spec only, no torch import). Stays empty when there is nothing to correct.
 _TORCH_PROBE_LD_PATH=""
 _torch_probe_ld_path() {
     [ "$OS" != "macos" ] || return 0
@@ -4511,9 +4488,9 @@ print(":".join(dirs + keep))
 ' 2>/dev/null || return 0
 }
 
-# Run "$@" under the corrected library path when there is one. A subshell keeps
-# the export out of the installer's own environment, and exec preserves the exit
-# status the callers read -- timeout(1)'s 124 in particular.
+# Run "$@" under the corrected library path when there is one. The subshell keeps the
+# export out of the installer's environment; exec preserves the exit status the
+# callers read, timeout(1)'s 124 in particular.
 _torch_probe_exec() {
     if [ -n "$_TORCH_PROBE_LD_PATH" ]; then
         ( LD_LIBRARY_PATH="$_TORCH_PROBE_LD_PATH"; export LD_LIBRARY_PATH; exec "$@" )
@@ -4522,43 +4499,37 @@ _torch_probe_exec() {
     fi
 }
 
-# `import torch` can block forever rather than fail -- a wedged Intel driver is
-# the known case, which is why _PREV_TORCH_VER above reads version.py off disk
-# instead of starting an interpreter. This gate has to run the import for real,
-# so bound it. Not _run_bounded: its 10s is sized for nvidia-smi, and a cold
-# first import of the CUDA libraries legitimately takes far longer.
+# `import torch` can block forever rather than fail -- a wedged Intel driver is the
+# known case, which is why _PREV_TORCH_VER above reads version.py off disk. This gate
+# runs the import for real, so bound it. Not _run_bounded: its 10s is sized for
+# nvidia-smi, and a cold first import of the CUDA libraries takes far longer.
 #
-# "Timed out" has to be a distinct verdict from "raised", not a flavour of
-# non-zero: a timed-out import never reported anything, so we have not learned
-# that torch is broken. Reinstalling cannot unwedge a driver, and failing would
-# roll back a venv that is probably fine, so a timeout warns and continues while
-# a real ImportError still fails the install.
+# "Timed out" is a distinct verdict from "raised", not a flavour of non-zero: a
+# timed-out import never reported anything, so we have not learned that torch is
+# broken. Reinstalling cannot unwedge a driver and failing would roll back a
+# probably-fine venv, so a timeout warns and continues while a real ImportError fails.
 #
-# The deadline is enforced inside Python rather than by timeout(1) alone, because
-# timeout(1) is GNU coreutils: macOS does not ship it and the installer's macOS
-# path never pulls it in, so the bound silently disappeared on the platform where
-# it was the only bound. faulthandler's watchdog is a native thread, so it still
-# fires when the import is wedged in C with the GIL held -- a driver ioctl, which
-# is precisely the case being bounded. timeout(1) is still layered on where it
-# exists, to also cover a hang before Python gets far enough to arm the watchdog.
+# The deadline is enforced inside Python rather than by timeout(1) alone because
+# timeout(1) is GNU coreutils: macOS does not ship it, so the bound silently
+# disappeared on the platform where it was the only bound. faulthandler's watchdog is
+# a native thread, so it still fires when the import is wedged in C with the GIL held
+# (a driver ioctl, precisely the case being bounded). timeout(1) is still layered on
+# where it exists, to cover a hang before Python can arm the watchdog.
 #
-# Exit codes below are ours: 0 imported, 3 raised, and anything else (the
-# watchdog's 1, timeout(1)'s 124) means the probe never got far enough to say.
+# Exit codes below are ours: 0 imported, 3 raised, anything else (the watchdog's 1,
+# timeout(1)'s 124) means the probe never got far enough to say.
 _TORCH_REPAIR_DONE=false
 _TORCH_IMPORT_TIMEOUT="${UNSLOTH_TORCH_IMPORT_TIMEOUT:-180}"
-# Must be a non-negative integer: it is interpolated into both the Python
-# watchdog and timeout(1), neither of which would do anything sensible with a
-# stray value. 0 disables the bound. Anything else falls back to the default.
+# Must be a non-negative integer: it is interpolated into both the Python watchdog
+# and timeout(1). 0 disables the bound; anything else falls back to the default.
 case "$_TORCH_IMPORT_TIMEOUT" in
     '' | *[!0-9]*) _TORCH_IMPORT_TIMEOUT=180 ;;
 esac
 
-# A here-doc would have to be piped into python, which loses the exit status.
-# The traceback is printed rather than swallowed so the diagnostic below can read
-# it off this same bounded run: re-running a bare `import torch` to collect the
-# message would be unbounded and would skip _torch_probe_exec, so an import that
-# wedges only without the corrected library path -- the case that wrapper exists
-# for -- would hang the installer while it was merely composing an error string.
+# A here-doc would have to be piped into python, which loses the exit status. The
+# traceback is printed so the diagnostic below can read it off this same bounded run:
+# a bare `import torch` to collect the message would be unbounded and skip
+# _torch_probe_exec, hanging the installer while merely composing an error string.
 _torch_probe_py() {
     printf '%s\n' "
 import faulthandler, sys, traceback
@@ -4574,12 +4545,10 @@ sys.exit(0)
 "
 }
 
-# Run the probe under every bound there is. stdout/stderr are the caller's to
-# direct: the probe discards them, the diagnostic keeps stderr.
+# Run the probe under every bound there is. stdout/stderr are the caller's to direct.
 _torch_probe_run() {
     if command -v timeout >/dev/null 2>&1 && [ "$_TORCH_IMPORT_TIMEOUT" -gt 0 ]; then
-        # Slack over the inner deadline so the watchdog is what normally fires;
-        # timeout(1) only catches a hang before Python arms it.
+        # Slack over the inner deadline so the watchdog normally fires first.
         _torch_probe_exec timeout "$((_TORCH_IMPORT_TIMEOUT + 30))" \
             "$_VENV_PY" -c "$(_torch_probe_py)"
     else
@@ -4591,12 +4560,11 @@ _torch_import_probe() {
     _torch_probe_run >/dev/null 2>&1
 }
 
-# Only two statuses mean "no verdict": 1 from faulthandler's watchdog, which
-# _exit(1)s after dumping, and 124 from timeout(1). Everything else -- 3 for a
-# caught import error, 139/134 for a SIGSEGV/SIGABRT inside a CUDA or ROCm
-# library, 127 for an interpreter that will not start -- is the probe telling us
-# torch is broken. Treating those as timeouts would warn and commit the venv,
-# which is the silent success this whole gate exists to stop.
+# Only two statuses mean "no verdict": 1 from faulthandler's watchdog, which _exit(1)s
+# after dumping, and 124 from timeout(1). Everything else (3 for a caught import
+# error, 139/134 for a SIGSEGV/SIGABRT inside a CUDA or ROCm library, 127 for an
+# interpreter that will not start) is the probe telling us torch is broken. Treating
+# those as timeouts would warn and commit the venv, the silent success this gate stops.
 _torch_probe_timed_out() {
     [ "$1" = "1" ] || [ "$1" = "124" ]
 }
@@ -4606,13 +4574,10 @@ _torch_import_error() {
     _torch_probe_run 2>&1 >/dev/null || true
 }
 
-# Runs twice: once here, and once after studio setup. Setup is not a read-only
-# step -- install_python_stack.py resolves and can reinstall torch itself (the
-# ROCm reroute in _ensure_rocm_torch, the CUDA-ladder repairs) -- so this probe
-# is not the final state of the venv. Without the second call the installer
-# could verify a good torch, let setup replace it with a broken one, and still
-# commit and report success. The second call is also the cheap one: on the
-# common path it is a single import of a warm module cache.
+# Runs twice: once here, once after studio setup. Setup is not read-only --
+# install_python_stack.py can reinstall torch itself -- so this probe is not the final
+# state of the venv. Without the second call the installer could verify a good torch,
+# let setup replace it with a broken one, and still commit and report success.
 _torch_import_gate() {
     [ "$SKIP_TORCH" = false ] || return 0
 
@@ -4627,31 +4592,29 @@ _torch_import_gate() {
         _torch_import_timed_out=true
     fi
 
-    # Repair only on the authoritative pass. Before studio setup the runtime
-    # libraries torch links against may not be installed yet, and reinstalling
-    # the trio cannot supply them: on a fresh Windows host the advisory pass
-    # would burn the run's single repair -- a full refresh of every wheel, since
-    # --reinstall-package implies --refresh-package -- on a WinError 126 that
-    # Ensure-VCRedist is about to fix for free.
+    # Repair only on the authoritative pass: before studio setup the runtime libraries
+    # torch links against may be missing and reinstalling the trio cannot supply them,
+    # so the advisory pass would burn the run's single repair (a full refresh of every
+    # wheel, since --reinstall-package implies --refresh-package) on a WinError 126
+    # that Ensure-VCRedist is about to fix for free.
     if [ "$1" = "final" ] && [ "$_torch_import_ok" = false ] &&
         [ "$_torch_import_timed_out" = false ] && [ "$_TORCH_REPAIR_DONE" = false ]; then
-        # Re-run only to capture the message: a healthy torch can still write to
-        # stderr, so the exit status above is the test and this is the diagnosis.
+        # A healthy torch still writes to stderr, so the exit status above is the
+        # test and this re-run only supplies the message.
         _torch_import_err=$(_torch_import_error)
         substep "[WARN] PyTorch is installed but cannot be imported:" "$C_WARN"
         substep "[WARN]   $_torch_import_err" "$C_WARN"
         substep "reinstalling PyTorch once before giving up..."
-        # At most one reinstall per run, not one per gate: the gate runs twice and
-        # a wheel that survived the first repair will not be fixed by a second.
+        # One reinstall per run, not per gate: the gate runs twice, and a wheel that
+        # survived the first repair will not be fixed by a second.
         _TORCH_REPAIR_DONE=true
-        # `|| true`: the import re-probe below is the verdict, not the reinstall's
-        # exit code, and set -e must not abort before that probe runs.
+        # `|| true`: the re-probe below is the verdict, not the reinstall's exit
+        # code, and set -e must not abort before that probe runs.
         _reinstall_torch_trio || true
-        # Recompute the ordering: the reinstall is allowed to add, remove or
-        # replace the site-packages/nvidia/*/lib directories the first pass
-        # derived it from, and a half-written CUDA wheel -- the case this repair
-        # exists for -- is exactly when that list was wrong. Re-probing under the
-        # stale path could reject a wheel that Studio's own runtime fix handles.
+        # Recompute the ordering: the reinstall can add, remove or replace the
+        # site-packages/nvidia/*/lib directories the first pass derived it from, and a
+        # half-written CUDA wheel -- the case this repair exists for -- is exactly when
+        # that list was wrong. A stale path could reject a wheel Studio handles fine.
         _TORCH_PROBE_LD_PATH=$(_torch_probe_ld_path)
         _torch_probe_rc=0
         _torch_import_probe || _torch_probe_rc=$?
@@ -4671,14 +4634,12 @@ _torch_import_gate() {
     fi
 
     if [ "$_torch_import_ok" = false ] && [ "$1" != "final" ]; then
-        # Not a verdict yet. Studio setup installs system runtime libraries that
-        # torch links against -- on Windows setup.ps1's Ensure-VCRedist, whose own
-        # comment is "the prebuilt llama.cpp and PyTorch need it" -- and it has not
-        # run at this point. Failing here would roll back over a dependency the
-        # installer was about to install for itself, which is what a fresh Windows
-        # host without the VC++ redistributable looks like: `import torch` dies on
-        # WinError 126 loading c10.dll until that runtime is present. Say so and
-        # continue; the post-setup call is the one that decides.
+        # Not a verdict yet: studio setup installs system runtime libraries torch
+        # links against (on Windows, setup.ps1's Ensure-VCRedist) and has not run. On
+        # a fresh Windows host `import torch` dies on WinError 126 loading c10.dll
+        # until that runtime is present, so failing here would roll back over a
+        # dependency the installer is about to install itself. The post-setup call
+        # decides.
         _torch_import_err=$(_torch_import_error)
         substep "[WARN] PyTorch cannot be imported yet:" "$C_WARN"
         substep "[WARN]   $_torch_import_err" "$C_WARN"
@@ -4702,8 +4663,8 @@ _torch_import_gate() {
     fi
 }
 
-# Advisory: diagnoses and repairs, but cannot fail the install, because studio
-# setup has not yet installed the runtime libraries torch links against.
+# Advisory: diagnoses but cannot fail the install, because studio setup has not yet
+# installed the runtime libraries torch links against.
 _torch_import_gate advisory
 
 # ── CI only: overlay a source checkout over the package just installed ──
@@ -4891,12 +4852,11 @@ if [ "$_SETUP_EXIT" -ne 0 ]; then
     exit "$_SETUP_EXIT"
 fi
 
-# Setup succeeded, and it both installs Python dependencies of its own (it can
-# reinstall torch on the way through) and installs the system runtime libraries
-# torch links against. So this is the first point where a failed import is
-# actually the installer's verdict rather than a not-yet -- and the last point
-# where exiting still rolls the previous environment back, since
-# _commit_studio_venv_replacement below drops that copy.
+# Setup succeeded, and it both reinstalls torch on the way through and installs the
+# system runtime libraries torch links against. So this is the first point where a
+# failed import is a verdict rather than a not-yet, and the last where exiting still
+# rolls the previous environment back, since _commit_studio_venv_replacement below
+# drops that copy.
 _torch_import_gate final
 
 _commit_studio_venv_replacement

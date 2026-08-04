@@ -568,17 +568,15 @@ fi
 echo ""
 echo "=== Apple Silicon x86_64 (Rosetta) venv rebuild ==="
 
-# Extract the real guard region from install.sh so we exercise the shipped logic:
-# the venv probe, the Apple Silicon arch rebuild, and the interpreter-version
-# recovery that follows it. They are separate top-level blocks (an x86_64 venv can
-# still land on a bad interpreter once recreated), so the range runs from the
-# shared probe down to just before the torch constraint block.
+# Extract the real guard region from install.sh so we exercise the shipped logic: the
+# venv probe, the Apple Silicon arch rebuild, and the interpreter-version recovery.
+# They are separate top-level blocks (an x86_64 venv can still land on a bad
+# interpreter once recreated), so the range spans probe to torch constraint block.
 _GUARD_FILE=$(mktemp)
 sed -n '/^_inspect_venv() {$/,/^# Default torch constraint/p' "$INSTALL_SH" \
     | sed '$d' > "$_GUARD_FILE"
 
-# The guard leans on two shipped helpers. Take the real ones rather than
-# restating their comparison and platform rules here.
+# Take the two shipped helpers rather than restating their rules here.
 _HELPERS_FILE=$(mktemp)
 {
     sed -n '/^version_ge()/,/^}/p' "$INSTALL_SH"
@@ -613,8 +611,8 @@ run_install_cmd() {
         dir="$3"; sel=""; shift 3
         while [ $# -gt 0 ]; do [ "$1" = "--python" ] && { sel="$2"; shift; }; shift; done
         echo "$sel" >> "$RECREATE_LOG"
-        # NO_313_9 models a uv whose managed-Python manifest predates 3.13.9, the
-        # condition that put users on the broken patch in the first place.
+        # NO_313_9 models a uv manifest predating 3.13.9, which is what put users
+        # on the broken patch in the first place.
         case "$sel" in
             *'>=3.13.9'*)
                 [ -n "$NO_313_9" ] && return 1
@@ -653,18 +651,16 @@ RUNNER_EOF
     assert_eq "arm64 3.13.8 venv recovered onto 3.13.9+, not downgraded to 3.12" \
         "arm64 3.13.12 | cpython->=3.13.9,<3.14-macos-aarch64-none" \
         "$(_run_guard '' macos arm64 arm64 3.13.8 '' '')"
-    # Three requests, in this order: the arch-explicit range, then the bare range
-    # (a specifier nested in the platform triple is undocumented, so 3.13 gets a
-    # second chance without it before a whole minor is given up), then 3.12 --
-    # which is back on the triple, because a plain version has always been the
-    # documented shape and uv could otherwise satisfy it from a cached x86_64.
+    # Three requests in order: the arch-explicit range, then the bare range (a
+    # specifier nested in the triple is undocumented, so 3.13 gets a second chance
+    # before a whole minor is given up), then 3.12 -- back on the triple, since a
+    # plain version is the documented shape and uv could otherwise reuse a cached x86_64.
     assert_eq "3.12 fallback keeps the Apple Silicon triple when uv has no 3.13.9" \
         "arm64 3.12.7 | cpython->=3.13.9,<3.14-macos-aarch64-none;>=3.13.9,<3.14;cpython-3.12-macos-aarch64-none" \
         "$(_run_guard '' macos arm64 arm64 3.13.8 '' 1)"
-    # The Rosetta rebuild still applies under --no-torch (mlx ships no x86_64
-    # wheels either), but the interpreter-version guard does not: nothing in a
-    # GGUF-only install imports torch, so deleting the venv to chase 3.13.9 is
-    # pure churn -- and a hard failure on a box that can fetch neither release.
+    # The Rosetta rebuild still applies under --no-torch (mlx ships no x86_64 wheels
+    # either), but the version guard does not: nothing in a GGUF-only install imports
+    # torch, so chasing 3.13.9 is churn, and a hard failure on an air-gapped box.
     assert_eq "--no-torch leaves a 3.13.8 Apple Silicon venv alone" \
         "arm64 3.13.8 | " "$(_run_guard '' macos arm64 arm64 3.13.8 '' '' true)"
     assert_eq "--no-torch still rebuilds an x86_64 venv, just not the version" \
