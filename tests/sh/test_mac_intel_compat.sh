@@ -653,8 +653,13 @@ RUNNER_EOF
     assert_eq "arm64 3.13.8 venv recovered onto 3.13.9+, not downgraded to 3.12" \
         "arm64 3.13.12 | cpython->=3.13.9,<3.14-macos-aarch64-none" \
         "$(_run_guard '' macos arm64 arm64 3.13.8 '' '')"
+    # Three requests, in this order: the arch-explicit range, then the bare range
+    # (a specifier nested in the platform triple is undocumented, so 3.13 gets a
+    # second chance without it before a whole minor is given up), then 3.12 --
+    # which is back on the triple, because a plain version has always been the
+    # documented shape and uv could otherwise satisfy it from a cached x86_64.
     assert_eq "3.12 fallback keeps the Apple Silicon triple when uv has no 3.13.9" \
-        "arm64 3.12.7 | cpython->=3.13.9,<3.14-macos-aarch64-none;cpython-3.12-macos-aarch64-none" \
+        "arm64 3.12.7 | cpython->=3.13.9,<3.14-macos-aarch64-none;>=3.13.9,<3.14;cpython-3.12-macos-aarch64-none" \
         "$(_run_guard '' macos arm64 arm64 3.13.8 '' 1)"
     # The Rosetta rebuild still applies under --no-torch (mlx ships no x86_64
     # wheels either), but the interpreter-version guard does not: nothing in a

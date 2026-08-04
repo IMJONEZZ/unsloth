@@ -2562,6 +2562,20 @@ if [ "$SKIP_TORCH" = false ] && [ -x "$VENV_DIR/bin/python" ]; then
             if run_install_cmd "recreate venv (Python ${_PY_RECOVER_PRIMARY})" uv venv "$VENV_DIR" \
                 --python "$(_uv_python_spec "$_PY_RECOVER_PRIMARY")"; then
                 _PY_REBUILT=true
+            elif [ "$(_uv_python_spec "$_PY_RECOVER_PRIMARY")" != "$_PY_RECOVER_PRIMARY" ] &&
+                run_install_cmd "recreate venv (Python ${_PY_RECOVER_PRIMARY}, no arch qualifier)" \
+                    uv venv "$VENV_DIR" --python "$_PY_RECOVER_PRIMARY"; then
+                # Apple Silicon only, and only reachable if the combined form is
+                # rejected. uv does parse a specifier inside the platform triple
+                # -- verified from 0.2.30 through 0.10.7, and it is how
+                # PythonDownloadRequest parses the string -- but it is not in the
+                # documented grammar, so this keeps the 3.13 recovery working if
+                # that ever changes. Dropping the arch qualifier risks uv
+                # satisfying the request from a cached x86_64 build, which is why
+                # it is a fallback and not the first request; landing on 3.13.9+
+                # under Rosetta is still strictly better than dropping to 3.12,
+                # and the interpreter re-probe below is what actually decides.
+                _PY_REBUILT=true
             else
                 substep "this uv cannot provide Python 3.13.9 or newer; falling back to Python ${_PY_RECOVER_FALLBACK}"
                 if run_install_cmd "recreate venv (Python ${_PY_RECOVER_FALLBACK})" uv venv "$VENV_DIR" \

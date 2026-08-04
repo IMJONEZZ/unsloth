@@ -89,6 +89,13 @@ run_install_cmd() {
         case "$sel" in
             *'>=3.13.9'*)
                 [ -n "$NO_313_9" ] && return 1
+                # A PEP 440 range nested in the platform triple parses on every
+                # uv from 0.2.30 to 0.10.7, but it is not in uv's documented
+                # grammar. NO_TRIPLE_RANGE models a uv that stopped accepting it,
+                # so the bare-range retry is what has to keep 3.13 reachable.
+                case "$sel" in
+                    cpython-*) [ -n "$NO_TRIPLE_RANGE" ] && return 1 ;;
+                esac
                 make_python "$dir" "${RECOVER_313_VERSION:-3.13.12}" ;;
             *3.12*)
                 [ -n "$NO_312" ] && return 1
@@ -110,7 +117,7 @@ GUARD_RUNNER_EOF
         _rl=$(mktemp)
         env OS="$1" _ARCH="$2" _USER_PYTHON="$3" INIT_VER="$4" \
             NO_313_9="$5" NO_312="$6" FAKE_MACHINE="${7:-x86_64}" \
-            SKIP_TORCH="${8:-false}" RECREATE_LOG="$_rl" \
+            SKIP_TORCH="${8:-false}" NO_TRIPLE_RANGE="${9:-}" RECREATE_LOG="$_rl" \
             bash "$_GUARD_RUNNER" "$_GUARD_FILE" "$_HELPERS_FILE" "$_vd/venv"
         _rc=$?
         rm -rf "$_vd"; rm -f "$_rl"
@@ -150,6 +157,20 @@ GUARD_RUNNER_EOF
     assert_eq "Apple Silicon keeps the arch-explicit triple on recovery" \
         "3.13.12 | cpython->=3.13.9,<3.14-macos-aarch64-none" \
         "$(_run_guard macos arm64 '' 3.13.8 '' '' arm64)"
+
+    # A range nested in the platform triple is undocumented, even though every uv
+    # from 0.2.30 to 0.10.7 parses it. If a uv ever stops, Apple Silicon must
+    # still land on 3.13.9+ rather than dropping a whole minor to 3.12 -- so the
+    # bare range is retried first, and only then the 3.12 fallback.
+    assert_eq "Apple Silicon retries the bare range before giving up on 3.13" \
+        "3.13.12 | cpython->=3.13.9,<3.14-macos-aarch64-none;>=3.13.9,<3.14" \
+        "$(_run_guard macos arm64 '' 3.13.8 '' '' arm64 false 1)"
+
+    # The retry is Apple-Silicon-only: everywhere else the two requests are the
+    # same string, so retrying it would just be a second identical failure.
+    assert_eq "Linux does not retry an identical request before falling back" \
+        "3.12.12 | >=3.13.9,<3.14;3.12" \
+        "$(_run_guard linux x86_64 '' 3.13.8 1 '' x86_64 false 1)"
 
     # --no-torch never imports torch, so the one defect in these interpreters
     # cannot bite. Rebuilding would delete a working GGUF-only venv, and on a box
