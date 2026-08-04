@@ -214,8 +214,28 @@ case "$2" in
         [ -n "$FAKE_TORCH_LD_DIRS" ] || exit 1
         printf '%s\n' "${FAKE_TORCH_LD_DIRS}:${LD_LIBRARY_PATH}" ;;
     *"import torch"*)
-        # A wedged GPU driver blocks the import instead of failing it.
-        if [ -n "$TORCH_WEDGE" ]; then sleep 30; exit 0; fi
+        # Two different scripts reach here. The gate's probe arms a faulthandler
+        # deadline and reports a raised import as exit 3; the diagnosis re-run is
+        # a bare `import torch` whose exit code nothing reads, only its stderr.
+        # Tell them apart by the watchdog line and emulate the right contract.
+        _probe=""
+        _deadline=""
+        case "$2" in
+            *dump_traceback_later*)
+                _probe=1
+                _deadline=$(printf '%s\n' "$2" |
+                    sed -n 's/.*dump_traceback_later(\([0-9]*\).*/\1/p' | head -1) ;;
+        esac
+        # A wedged GPU driver blocks the import instead of failing it. CPython's
+        # watchdog is a native thread, so it fires on time even though the import
+        # is stuck in C holding the GIL, and _exit(1)s. Without it -- the macOS
+        # case, where timeout(1) does not exist either -- nothing bounds this.
+        if [ -n "$TORCH_WEDGE" ]; then
+            if [ -n "$_probe" ] && [ -n "$_deadline" ] && [ "$_deadline" -gt 0 ]; then
+                sleep "$_deadline"; exit 1
+            fi
+            sleep 30; exit 0
+        fi
         # A system CUDA ahead of the wheel's own libs on LD_LIBRARY_PATH is what
         # ld.so resolves first, and the import dies on an undefined symbol.
         # Studio's entry point corrects the ordering before importing, so a probe
@@ -224,11 +244,13 @@ case "$2" in
             case ":$LD_LIBRARY_PATH:" in
                 ":$FAKE_TORCH_LD_DIRS:"*) ;;
                 *) echo "ImportError: libtorch_cuda.so: undefined symbol: ncclCommRegister" >&2
+                   if [ -n "$_probe" ]; then exit 3; fi
                    exit 1 ;;
             esac
         fi
         if [ -f "$TORCH_OK_MARKER" ]; then exit 0; fi
         echo "IndentationError: expected an indented block after function definition on line 4" >&2
+        if [ -n "$_probe" ]; then exit 3; fi
         exit 1 ;;
     *version_info*) echo "$FAKE_PY_VER" ;;
 esac
@@ -359,15 +381,58 @@ GATE_RUNNER_EOF
     rm -f "$_LD_PROBE_LOG"
 
     _GATE_OUT_FILE=$(mktemp)
-    if command -v timeout >/dev/null 2>&1; then
-        _run_gate_wedged && _rc=0 || _rc=$?
-        assert_eq "a wedged import does not fail the install" "0" "$_rc"
-        assert_eq "a wedged import attempts no repair" "" "$(cat "$_GATE_CALLS")"
-        assert_contains "a wedged import says so instead of blaming the wheel" \
-            "$(cat "$_GATE_OUT_FILE")" "did not finish importing"
+    _run_gate_wedged && _rc=0 || _rc=$?
+    assert_eq "a wedged import does not fail the install" "0" "$_rc"
+    assert_eq "a wedged import attempts no repair" "" "$(cat "$_GATE_CALLS")"
+    assert_contains "a wedged import says so instead of blaming the wheel" \
+        "$(cat "$_GATE_OUT_FILE")" "did not finish importing"
+
+    # The same wedge with timeout(1) removed from PATH. That is not a contrived
+    # case: timeout(1) is GNU coreutils, macOS does not ship it, and the macOS
+    # install path never pulls it in -- so this is what every Apple host runs.
+    # Before the deadline moved inside Python this hung forever here, which is
+    # the one platform where the bound was the only thing standing between a
+    # wedged driver and an installer that never returns.
+    _NOTIMEOUT_BIN=$(mktemp -d)
+    for _tool in bash sh sed cat rm mktemp sleep env chmod printf grep head dirname basename date; do
+        _tool_path=$(command -v "$_tool" 2>/dev/null) || continue
+        ln -sf "$_tool_path" "$_NOTIMEOUT_BIN/$_tool"
+    done
+    assert_eq "the stripped PATH really has no timeout(1)" \
+        "" "$(PATH="$_NOTIMEOUT_BIN" command -v timeout 2>/dev/null || true)"
+
+    _GATE_OUT_FILE=$(mktemp)
+    _bin=$(mktemp)
+    _marker=$(mktemp); rm -f "$_marker"
+    : > "$_GATE_CALLS"
+    _started=$(date +%s)
+    set +e
+    env PATH="$_NOTIMEOUT_BIN" SKIP_TORCH=false \
+        TORCH_INDEX_URL="https://download.pytorch.org/whl/cu128" \
+        REPAIR_WORKS="" TORCH_OK_MARKER="$_marker" CALL_LOG="$_GATE_CALLS" \
+        FAKE_PY_VER="3.13.12" TORCH_WEDGE=1 UNSLOTH_TORCH_IMPORT_TIMEOUT=2 \
+        "$_NOTIMEOUT_BIN/bash" "$_GATE_RUNNER" "$_GATE_FILE" "$_bin" \
+        > "$_GATE_OUT_FILE" 2>&1
+    _rc=$?
+    set -e
+    _elapsed=$(( $(date +%s) - _started ))
+    rm -f "$_bin" "$_marker"
+    assert_eq "a wedged import without timeout(1) still does not fail the install" \
+        "0" "$_rc"
+    assert_contains "a wedged import without timeout(1) still reports the timeout" \
+        "$(cat "$_GATE_OUT_FILE")" "did not finish importing"
+    assert_eq "a wedged import without timeout(1) attempts no repair" \
+        "" "$(cat "$_GATE_CALLS")"
+    # The deadline was 2s and the unbounded wedge is 30s: anything near 30 means
+    # the bound was dropped again. Generous headroom for a loaded runner.
+    if [ "$_elapsed" -lt 20 ]; then
+        assert_eq "a wedged import without timeout(1) is bounded, not just survived" \
+            "bounded" "bounded"
     else
-        echo "  SKIP: timeout(1) unavailable, cannot exercise the wedge path"
+        assert_eq "a wedged import without timeout(1) is bounded, not just survived" \
+            "bounded" "took ${_elapsed}s, the deadline was 2s"
     fi
+    rm -rf "$_NOTIMEOUT_BIN"
     rm -f "$_GATE_OUT_FILE"
 
     rm -f "$_GATE_RUNNER" "$_GATE_CALLS"
@@ -482,6 +547,43 @@ rm -rf "$_NODLDIR"
 rm -f "$_UVBLK2"
 
 rm -f "$_HELPERS_FILE"
+
+# ── the gate must also run after studio setup ──
+#
+# setup.sh is not a read-only step: install.sh calls it with SKIP_STUDIO_BASE=1,
+# which leaves _SKIP_PYTHON_DEPS false, so it runs install_python_stack and that
+# can reinstall torch (the ROCm reroute, the CUDA-ladder repairs). A gate that
+# only ran before setup could pass, watch setup replace torch with something
+# unimportable, and still commit and report success. The second call also has to
+# land before _commit_studio_venv_replacement, which drops the rollback copy:
+# after that point exiting no longer restores the user's previous environment.
+echo ""
+echo "=== the gate runs again after studio setup ==="
+
+_GATE_CALL_LINES=$(grep -n '^_torch_import_gate$' "$INSTALL_SH" | cut -d: -f1)
+_GATE_CALL_COUNT=$(printf '%s\n' "$_GATE_CALL_LINES" | grep -c . || true)
+assert_eq "the gate is invoked exactly twice" "2" "$_GATE_CALL_COUNT"
+
+_COMMIT_LINE=$(grep -n '^_commit_studio_venv_replacement$' "$INSTALL_SH" | cut -d: -f1 | head -1)
+_SETUP_LINE=$(grep -n '^if \[ "\$_SETUP_EXIT" -ne 0 \]; then$' "$INSTALL_SH" | cut -d: -f1 | head -1)
+_FIRST_CALL=$(printf '%s\n' "$_GATE_CALL_LINES" | head -1)
+_SECOND_CALL=$(printf '%s\n' "$_GATE_CALL_LINES" | tail -1)
+
+if [ "$_SECOND_CALL" -lt "$_COMMIT_LINE" ]; then
+    assert_eq "the post-setup gate runs before the venv is committed" "before" "before"
+else
+    assert_eq "the post-setup gate runs before the venv is committed" "before" "after"
+fi
+if [ "$_SECOND_CALL" -gt "$_SETUP_LINE" ]; then
+    assert_eq "the post-setup gate runs after studio setup" "after" "after"
+else
+    assert_eq "the post-setup gate runs after studio setup" "after" "before"
+fi
+if [ "$_FIRST_CALL" -lt "$_SETUP_LINE" ]; then
+    assert_eq "the first gate still runs during the install phase" "before" "before"
+else
+    assert_eq "the first gate still runs during the install phase" "before" "after"
+fi
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

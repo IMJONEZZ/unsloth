@@ -3459,7 +3459,23 @@ exit 0
     # Deliberately not gated on $TorchIndexUrl the way the flavor block above is:
     # that gate exists to identify a GPU wheel family, and reusing it here would skip
     # every path where no index was resolved while torch is still expected.
-    if (-not $SkipTorch) {
+    #
+    # Called twice: here, and again after studio setup. Setup is not read-only --
+    # studio/setup.ps1 leaves $SkipPythonDeps false under SKIP_STUDIO_BASE=1 and
+    # runs its own PyTorch pass (install_python_stack.py reinstalls torch on the
+    # ROCm reroute and the CUDA-ladder repairs), so this probe is not the final
+    # state of the venv. Without the second call the installer could verify a good
+    # torch, let setup replace it with a broken one, and still commit and report
+    # success.
+    #
+    # The verdict travels in $script:TorchGateFailure rather than as a return
+    # value, and every call site pipes to Out-Null. A PowerShell function returns
+    # its entire success stream, so anything that writes to it -- a substep that
+    # used Write-Output, a stray uncaptured expression -- would come back as a
+    # non-null "result" and abort a perfectly good install.
+    function Invoke-TorchImportGate {
+        $script:TorchGateFailure = $null
+        if ($SkipTorch) { return }
         $torchImport = Test-TorchImport -PythonExe $VenvPython
         if (-not $torchImport.Ok -and -not $torchImport.TimedOut) {
             substep "[WARN] PyTorch is installed but cannot be imported:" "Yellow"
@@ -3489,9 +3505,13 @@ exit 0
             substep "Training and export need a working PyTorch, so this install is not usable."
             substep "Re-run pinning a different interpreter:  `$env:UNSLOTH_PYTHON='3.12'"
             substep "Or re-run with --no-torch for a GGUF-only (chat) install."
-            return (Exit-InstallFailure "PyTorch is installed but cannot be imported: $($torchImport.Error)")
+            $script:TorchGateFailure = (Exit-InstallFailure "PyTorch is installed but cannot be imported: $($torchImport.Error)")
+            return
         }
     }
+
+    Invoke-TorchImportGate | Out-Null
+    if ($null -ne $script:TorchGateFailure) { return $script:TorchGateFailure }
 
     # ── CI only: overlay a source checkout over the package just installed ──
     # Mirrors install.sh. Not a consumer knob: no switch, absent from the usage text,
@@ -3693,6 +3713,14 @@ exit 0
         step "path" "added unsloth launcher to PATH"
     }
     Refresh-SessionPath  # sync current session with registry
+
+    # Setup succeeded, but it installs Python dependencies of its own and can
+    # reinstall torch on the way through, so re-run the gate on the venv as it
+    # actually stands. This is the last point where failing still restores the
+    # previous environment: Complete-StudioVenvRollback below drops that copy.
+    Invoke-TorchImportGate | Out-Null
+    if ($null -ne $script:TorchGateFailure) { return $script:TorchGateFailure }
+
     Complete-StudioVenvRollback
     $studioVenvReplacementCommitted = $true
     Remove-StaleStudioVenvRollbacks

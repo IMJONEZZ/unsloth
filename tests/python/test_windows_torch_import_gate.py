@@ -35,6 +35,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _install_ps1() -> str:
+    return INSTALL_PS1.read_text(encoding = "utf-8")
+
+
 def _extract(pattern: str) -> str:
     source = INSTALL_PS1.read_text(encoding = "utf-8")
     match = re.search(pattern, source, flags = re.DOTALL)
@@ -179,8 +183,15 @@ def _gate_script(
         probe_timeouts = [False] * len(probe_results)
     timeouts = ", ".join("$true" if t else "$false" for t in probe_timeouts)
     # See _probe_script: kept out of the f-string for pre-3.12 compatibility.
+    # Through the *call*, not just the function body: the gate is a function now
+    # so that it can also run after studio setup, and extracting only the
+    # definition would define it and never invoke it -- every assertion below
+    # would then pass against a gate that never ran.
     gate = _extract(
-        r"    # ── Refuse to finish on a torch that installed but cannot be imported ──.*?\n    \}\n"
+        r"    # ── Refuse to finish on a torch that installed but cannot be imported ──"
+        r".*?\n    \}\n\n"
+        r"    Invoke-TorchImportGate \| Out-Null\n"
+        r"    if \(\$null -ne \$script:TorchGateFailure\) \{ return \$script:TorchGateFailure \}\n"
     )
     skip = "$true" if skip_torch else "$false"
     return f"""
@@ -201,12 +212,18 @@ function Test-TorchImport {{
 # the failure path, so a counter printed after the block is never reached in
 # exactly the case under test.
 function Invoke-TorchTrioReinstall {{ $script:RepairCalls++; Write-Host "REPAIR_ATTEMPTED"; return 0 }}
-function substep {{ param([string]$Message, [string]$Color = 'DarkGray') Write-Output ("SUBSTEP: " + $Message) }}
-function Restore-StudioVenvRollback {{ Write-Output "ROLLBACK_RESTORED" }}
+# Write-Host, matching the real substep (install.ps1:506) and Exit-InstallFailure.
+# That distinction is load-bearing, not cosmetic: the gate's call sites pipe to
+# Out-Null so a stray success-stream write cannot be mistaken for a failure
+# verdict, so a stub that used Write-Output would be swallowed here while the
+# shipped code still prints. Write-Host bypasses the success stream and lands on
+# the process stdout these assertions read.
+function substep {{ param([string]$Message, [string]$Color = 'DarkGray') Write-Host ("SUBSTEP: " + $Message) }}
+function Restore-StudioVenvRollback {{ Write-Host "ROLLBACK_RESTORED" }}
 function Exit-InstallFailure {{
     param([Parameter(Mandatory = $true)][string]$Message, [int]$Code = 1)
     Restore-StudioVenvRollback
-    Write-Output ("EXIT_FAILURE: " + $Message)
+    Write-Host ("EXIT_FAILURE: " + $Message)
     return $Code
 }}
 $SkipTorch = {skip}
@@ -359,9 +376,9 @@ def test_reinstall_prefers_the_rocm_index_with_pinned_companions():
     )
     assert "reinstall PyTorch (ROCm)" in out
     assert "repo.amd.com/rocm/whl/gfx1151" in out
-    assert (
-        "torchvision>=0.26.0,<0.27.0" in out
-    ), "a bare companion resolves an ABI-incompatible build"
+    assert "torchvision>=0.26.0,<0.27.0" in out, (
+        "a bare companion resolves an ABI-incompatible build"
+    )
 
 
 # ── The auto ROCm reroute sets a torch floor but no companion pins ──
@@ -474,3 +491,53 @@ def test_the_rocm_repair_is_untouched_by_the_arm_exception():
     )
     assert "reinstall PyTorch (ROCm)" in out
     assert "torchaudio" in out, "the ROCm branch still pins its own companion trio"
+
+
+# ── the gate must also run after studio setup ──
+
+
+def test_the_gate_runs_again_after_studio_setup_before_the_venv_is_committed():
+    """studio/setup.ps1 reinstalls torch, so the first probe is not the verdict.
+
+    install.ps1 launches setup with SKIP_STUDIO_BASE=1, which leaves
+    $SkipPythonDeps false, so setup runs its own PyTorch pass and
+    install_python_stack.py can reinstall torch (the ROCm reroute, the CUDA
+    ladder repairs). A gate that only ran before that could pass, watch setup
+    replace torch with something unimportable, and still commit and report
+    success. The second call also has to land *before*
+    Complete-StudioVenvRollback, which is what drops the rollback copy: after
+    that point failing no longer restores the user's previous environment.
+    """
+    source = _install_ps1()
+    calls = [
+        m.start() for m in re.finditer(r"^\s*Invoke-TorchImportGate \| Out-Null$", source, re.M)
+    ]
+    assert len(calls) == 2, f"expected the gate to run twice, found {len(calls)}"
+
+    commit = source.index("\n    Complete-StudioVenvRollback")
+    assert calls[0] < commit, "the first gate runs during the install phase"
+    assert calls[1] < commit, "the post-setup gate must run before the venv is committed"
+
+    setup_done = source.index('Clear-TauriInstallError "studio setup completed"')
+    assert calls[1] > setup_done, "the second gate must run after studio setup, not before it"
+
+
+def test_the_gate_reports_through_a_script_scoped_sentinel_not_its_return_value():
+    """A PowerShell function returns its whole success stream.
+
+    So `if ($null -ne (Invoke-TorchImportGate))` would abort the install on any
+    stray uncaptured write inside the gate -- a substep that used Write-Output,
+    an unvoided call -- rather than on an actual torch failure. Piping to
+    Out-Null and carrying the verdict in $script:TorchGateFailure is what makes
+    the two call sites safe; this pins that shape so it cannot regress to the
+    obvious-looking version.
+    """
+    source = _install_ps1()
+    assert "$script:TorchGateFailure = (Exit-InstallFailure" in source
+    assert (
+        source.count("if ($null -ne $script:TorchGateFailure) { return $script:TorchGateFailure }")
+        == 2
+    )
+    assert "= Invoke-TorchImportGate" not in source, (
+        "the gate's verdict must not be read from its return value"
+    )

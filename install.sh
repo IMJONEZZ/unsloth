@@ -4501,27 +4501,71 @@ _torch_probe_exec() {
 # so bound it. Not _run_bounded: its 10s is sized for nvidia-smi, and a cold
 # first import of the CUDA libraries legitimately takes far longer.
 #
-# 124 is timeout(1)'s "killed on time", which is a different verdict from any
-# other non-zero exit: the import never reported anything, so we have not learned
+# "Timed out" has to be a distinct verdict from "raised", not a flavour of
+# non-zero: a timed-out import never reported anything, so we have not learned
 # that torch is broken. Reinstalling cannot unwedge a driver, and failing would
 # roll back a venv that is probably fine, so a timeout warns and continues while
 # a real ImportError still fails the install.
+#
+# The deadline is enforced inside Python rather than by timeout(1) alone, because
+# timeout(1) is GNU coreutils: macOS does not ship it and the installer's macOS
+# path never pulls it in, so the bound silently disappeared on the platform where
+# it was the only bound. faulthandler's watchdog is a native thread, so it still
+# fires when the import is wedged in C with the GIL held -- a driver ioctl, which
+# is precisely the case being bounded. timeout(1) is still layered on where it
+# exists, to also cover a hang before Python gets far enough to arm the watchdog.
+#
+# Exit codes below are ours: 0 imported, 3 raised, and anything else (the
+# watchdog's 1, timeout(1)'s 124) means the probe never got far enough to say.
 _TORCH_IMPORT_TIMEOUT="${UNSLOTH_TORCH_IMPORT_TIMEOUT:-180}"
+# Must be a non-negative integer: it is interpolated into both the Python
+# watchdog and timeout(1), neither of which would do anything sensible with a
+# stray value. 0 disables the bound. Anything else falls back to the default.
+case "$_TORCH_IMPORT_TIMEOUT" in
+    '' | *[!0-9]*) _TORCH_IMPORT_TIMEOUT=180 ;;
+esac
+
 _torch_import_probe() {
-    if command -v timeout >/dev/null 2>&1; then
-        _torch_probe_exec timeout "$_TORCH_IMPORT_TIMEOUT" "$_VENV_PY" -c "import torch" >/dev/null 2>&1
+    # A here-doc would have to be piped into python, which loses the exit status.
+    _probe_py="
+import faulthandler, sys
+if $_TORCH_IMPORT_TIMEOUT > 0:
+    faulthandler.dump_traceback_later($_TORCH_IMPORT_TIMEOUT, exit = True)
+try:
+    import torch
+except BaseException:
+    sys.exit(3)
+faulthandler.cancel_dump_traceback_later()
+sys.exit(0)
+"
+    if command -v timeout >/dev/null 2>&1 && [ "$_TORCH_IMPORT_TIMEOUT" -gt 0 ]; then
+        # Slack over the inner deadline so the watchdog is what normally fires;
+        # timeout(1) only catches a hang before Python arms it.
+        _torch_probe_exec timeout "$((_TORCH_IMPORT_TIMEOUT + 30))" \
+            "$_VENV_PY" -c "$_probe_py" >/dev/null 2>&1
     else
-        _torch_probe_exec "$_VENV_PY" -c "import torch" >/dev/null 2>&1
+        _torch_probe_exec "$_VENV_PY" -c "$_probe_py" >/dev/null 2>&1
     fi
 }
 
-if [ "$SKIP_TORCH" = false ]; then
+# Runs twice: once here, and once after studio setup. Setup is not a read-only
+# step -- install_python_stack.py resolves and can reinstall torch itself (the
+# ROCm reroute in _ensure_rocm_torch, the CUDA-ladder repairs) -- so this probe
+# is not the final state of the venv. Without the second call the installer
+# could verify a good torch, let setup replace it with a broken one, and still
+# commit and report success. The second call is also the cheap one: on the
+# common path it is a single import of a warm module cache.
+_torch_import_gate() {
+    [ "$SKIP_TORCH" = false ] || return 0
+
     _TORCH_PROBE_LD_PATH=$(_torch_probe_ld_path)
     _torch_import_ok=false
     _torch_import_timed_out=false
-    if _torch_import_probe; then
+    _torch_probe_rc=0
+    _torch_import_probe || _torch_probe_rc=$?
+    if [ "$_torch_probe_rc" = 0 ]; then
         _torch_import_ok=true
-    elif [ "$?" = 124 ]; then
+    elif [ "$_torch_probe_rc" != 3 ]; then
         _torch_import_timed_out=true
     fi
 
@@ -4535,9 +4579,17 @@ if [ "$SKIP_TORCH" = false ]; then
         # `|| true`: the import re-probe below is the verdict, not the reinstall's
         # exit code, and set -e must not abort before that probe runs.
         _reinstall_torch_trio || true
-        if _torch_import_probe; then
+        # Recompute the ordering: the reinstall is allowed to add, remove or
+        # replace the site-packages/nvidia/*/lib directories the first pass
+        # derived it from, and a half-written CUDA wheel -- the case this repair
+        # exists for -- is exactly when that list was wrong. Re-probing under the
+        # stale path could reject a wheel that Studio's own runtime fix handles.
+        _TORCH_PROBE_LD_PATH=$(_torch_probe_ld_path)
+        _torch_probe_rc=0
+        _torch_import_probe || _torch_probe_rc=$?
+        if [ "$_torch_probe_rc" = 0 ]; then
             _torch_import_ok=true
-        elif [ "$?" = 124 ]; then
+        elif [ "$_torch_probe_rc" != 3 ]; then
             _torch_import_timed_out=true
         fi
     fi
@@ -4563,7 +4615,9 @@ if [ "$SKIP_TORCH" = false ]; then
         substep "Or re-run with --no-torch for a GGUF-only (chat) install."
         exit 1
     fi
-fi
+}
+
+_torch_import_gate
 
 # ── CI only: overlay a source checkout over the package just installed ──
 # Not a consumer knob: no flag, absent from --help, ignored unless
@@ -4749,6 +4803,12 @@ if [ "$_SETUP_EXIT" -ne 0 ]; then
     echo ""
     exit "$_SETUP_EXIT"
 fi
+
+# Setup succeeded, but it installs Python dependencies of its own and can
+# reinstall torch on the way through, so re-run the gate on the venv as it
+# actually stands. This is the last point where exiting still rolls the previous
+# environment back -- _commit_studio_venv_replacement below drops that copy.
+_torch_import_gate
 
 _commit_studio_venv_replacement
 
