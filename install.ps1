@@ -2847,6 +2847,79 @@ exit 0
         return $false
     }
 
+    # Does `import torch` actually work? Returns an object with Ok and Error.
+    # Get-InstalledTorchTag above cannot answer this: it returns $null both for a
+    # torch that is absent and for one that raises, so the caller cannot tell a
+    # missing package from a broken interpreter.
+    #
+    # Same ProcessStartInfo + async-drain + timeout shape as Get-InstalledTorchTag,
+    # for the same deadlock reasons. install.sh probes twice, taking the exit status
+    # from one run and the message from a second, because POSIX sh cannot easily
+    # capture both at once. One run yields both here, which is observably identical
+    # and cannot report a status from one process and a message from another.
+    function Test-TorchImport {
+        param(
+            [string]$PythonExe,
+            [int]$TimeoutMs = 30000
+        )
+        if (-not $PythonExe -or -not (Test-Path -LiteralPath $PythonExe)) {
+            return [pscustomobject]@{ Ok = $false; Error = "no interpreter at $PythonExe" }
+        }
+        try {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $PythonExe
+            $psi.Arguments = '-c "import torch"'
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            $outTask = $proc.StandardOutput.ReadToEndAsync()
+            $errTask = $proc.StandardError.ReadToEndAsync()
+            $finished = $proc.WaitForExit($TimeoutMs)
+            if (-not $finished) {
+                try { $proc.Kill() } catch {}
+                # Floor, not [int]: PowerShell rounds .5 to even, so [int](1500/1000)
+                # would report 2s for a 1.5s budget.
+                $seconds = [math]::Floor($TimeoutMs / 1000)
+                return [pscustomobject]@{ Ok = $false; Error = "import torch did not finish within ${seconds}s" }
+            }
+            [void]$outTask.GetAwaiter().GetResult()
+            $stderr = $errTask.GetAwaiter().GetResult().Trim()
+            # Exit code is the test, not stderr: a healthy torch still warns on stderr.
+            if ($proc.ExitCode -eq 0) { return [pscustomobject]@{ Ok = $true; Error = "" } }
+            # Last non-blank line: an import failure prints a full traceback and the
+            # exception itself is the part a user can act on.
+            if ($stderr) {
+                $detail = ($stderr -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 1).Trim()
+            } else {
+                $detail = "exit code $($proc.ExitCode), no error output"
+            }
+            return [pscustomobject]@{ Ok = $false; Error = $detail }
+        } catch {
+            return [pscustomobject]@{ Ok = $false; Error = $_.Exception.Message }
+        }
+    }
+
+    # Reinstall the torch trio through whichever index this run already resolved.
+    # Mirrors _reinstall_torch_trio in install.sh, with the extra ROCm branch the
+    # flavor block above needs: repo.amd.com pins its own companion versions, and a
+    # bare torchvision/torchaudio there resolves an ABI-incompatible build.
+    function Invoke-TorchTrioReinstall {
+        if ($ROCmIndexUrl) {
+            $rocmSpec = if ($ROCmTorchFloor) { $ROCmTorchFloor } else { "torch" }
+            $visionSpec = if ($PinnedRocmVisionSpec) { $PinnedRocmVisionSpec } else { "torchvision" }
+            $audioSpec = if ($PinnedRocmAudioSpec) { $PinnedRocmAudioSpec } else { "torchaudio" }
+            return Invoke-InstallCommandRetry -Label "reinstall PyTorch (ROCm)" -Command { uv pip install --python $VenvPython --force-reinstall --default-index $ROCmIndexUrl $rocmSpec $visionSpec $audioSpec }
+        }
+        if ($TorchIndexUrl) {
+            return Invoke-InstallCommandRetry -Label "reinstall PyTorch" -Command { uv pip install --python $VenvPython "torch>=2.4,<2.11.0" "torchvision>=0.19,<0.26.0" "torchaudio>=2.4,<2.11.0" --default-index $TorchIndexUrl --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio }
+        }
+        # No index resolved. Still repairable: a plain resolve is what a CPU-only
+        # host would have installed in the first place.
+        return Invoke-InstallCommandRetry -Label "reinstall PyTorch" -Command { uv pip install --python $VenvPython "torch>=2.4,<2.11.0" "torchvision>=0.19,<0.26.0" "torchaudio>=2.4,<2.11.0" --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio }
+    }
+
     # An explicit pin is authoritative: the AMD ROCm reroute below must not rewrite it
     # (e.g. a deliberate cpu pin on an AMD host).
     $TorchIndexPinned = (-not [string]::IsNullOrWhiteSpace($env:UNSLOTH_TORCH_INDEX_URL)) -or `
@@ -3302,6 +3375,46 @@ exit 0
                 Write-Host "  [WARN] Training and GPU inference will run on CPU until this is fixed." -ForegroundColor Yellow
                 Write-Host "  [WARN] Re-run this installer, or reinstall the GPU build manually for your GPU." -ForegroundColor Yellow
             }
+        }
+    }
+
+    # ── Refuse to finish on a torch that installed but cannot be imported ──
+    # Get-InstalledTorchTag returns $null for a torch that raises on import exactly
+    # as it does for one that is absent, so an interpreter-level ImportError (a
+    # CPython patch carrying gh-139783, a half-written wheel, an unresolved CUDA
+    # DLL) skips both flavor branches above and the installer reports success.
+    # Studio then sets CHAT_ONLY_REASON=detection_failed and greys out Train, which
+    # is how #7803 stayed invisible on a working 2-GPU box. Import it once for real.
+    #
+    # Repair once, because a truncated wheel is worth exactly one retry, then fail.
+    # Exit-InstallFailure runs Restore-StudioVenvRollback, so a failed upgrade leaves
+    # the previous working install rather than a broken one.
+    #
+    # Deliberately not gated on $TorchIndexUrl the way the flavor block above is:
+    # that gate exists to identify a GPU wheel family, and reusing it here would skip
+    # every path where no index was resolved while torch is still expected.
+    if (-not $SkipTorch) {
+        $torchImport = Test-TorchImport -PythonExe $VenvPython
+        if (-not $torchImport.Ok) {
+            substep "[WARN] PyTorch is installed but cannot be imported:" "Yellow"
+            substep "[WARN]   $($torchImport.Error)" "Yellow"
+            substep "reinstalling PyTorch once before giving up..."
+            # The re-probe is the verdict, not this exit code: a reinstall can report
+            # failure over a retried network hiccup and still leave torch importable.
+            [void](Invoke-TorchTrioReinstall)
+            $torchImport = Test-TorchImport -PythonExe $VenvPython
+        }
+        if (-not $torchImport.Ok) {
+            $torchPyVer = (& $VenvPython -c "import sys; print('{}.{}.{}'.format(*sys.version_info[:3]))" 2>$null | Out-String).Trim()
+            if (-not $torchPyVer) { $torchPyVer = "unknown" }
+            Write-Host ""
+            Write-Host "  [ERROR] PyTorch is installed but cannot be imported" -ForegroundColor Red
+            substep "Python:  $torchPyVer"
+            substep "Error:   $($torchImport.Error)"
+            substep "Training and export need a working PyTorch, so this install is not usable."
+            substep "Re-run pinning a different interpreter:  `$env:UNSLOTH_PYTHON='3.12'"
+            substep "Or re-run with --no-torch for a GGUF-only (chat) install."
+            return (Exit-InstallFailure "PyTorch is installed but cannot be imported: $($torchImport.Error)")
         }
     }
 
