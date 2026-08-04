@@ -4531,6 +4531,7 @@ _torch_probe_exec() {
 #
 # Exit codes below are ours: 0 imported, 3 raised, and anything else (the
 # watchdog's 1, timeout(1)'s 124) means the probe never got far enough to say.
+_TORCH_REPAIR_DONE=false
 _TORCH_IMPORT_TIMEOUT="${UNSLOTH_TORCH_IMPORT_TIMEOUT:-180}"
 # Must be a non-negative integer: it is interpolated into both the Python
 # watchdog and timeout(1), neither of which would do anything sensible with a
@@ -4583,13 +4584,17 @@ _torch_import_gate() {
         _torch_import_timed_out=true
     fi
 
-    if [ "$_torch_import_ok" = false ] && [ "$_torch_import_timed_out" = false ]; then
+    if [ "$_torch_import_ok" = false ] && [ "$_torch_import_timed_out" = false ] &&
+        [ "$_TORCH_REPAIR_DONE" = false ]; then
         # Re-run only to capture the message: a healthy torch can still write to
         # stderr, so the exit status above is the test and this is the diagnosis.
         _torch_import_err=$("$_VENV_PY" -c "import torch" 2>&1 >/dev/null || true)
         substep "[WARN] PyTorch is installed but cannot be imported:" "$C_WARN"
         substep "[WARN]   $_torch_import_err" "$C_WARN"
         substep "reinstalling PyTorch once before giving up..."
+        # At most one reinstall per run, not one per gate: the gate runs twice and
+        # a wheel that survived the first repair will not be fixed by a second.
+        _TORCH_REPAIR_DONE=true
         # `|| true`: the import re-probe below is the verdict, not the reinstall's
         # exit code, and set -e must not abort before that probe runs.
         _reinstall_torch_trio || true
@@ -4616,6 +4621,23 @@ _torch_import_gate() {
         _torch_import_ok=true
     fi
 
+    if [ "$_torch_import_ok" = false ] && [ "$1" != "final" ]; then
+        # Not a verdict yet. Studio setup installs system runtime libraries that
+        # torch links against -- on Windows setup.ps1's Ensure-VCRedist, whose own
+        # comment is "the prebuilt llama.cpp and PyTorch need it" -- and it has not
+        # run at this point. Failing here would roll back over a dependency the
+        # installer was about to install for itself, which is what a fresh Windows
+        # host without the VC++ redistributable looks like: `import torch` dies on
+        # WinError 126 loading c10.dll until that runtime is present. Say so and
+        # continue; the post-setup call is the one that decides.
+        _torch_import_err=$("$_VENV_PY" -c "import torch" 2>&1 >/dev/null || true)
+        substep "[WARN] PyTorch cannot be imported yet:" "$C_WARN"
+        substep "[WARN]   $_torch_import_err" "$C_WARN"
+        substep "[WARN] Studio setup installs runtime libraries torch needs, so this is" "$C_WARN"
+        substep "[WARN] re-checked after setup rather than failing the install now." "$C_WARN"
+        return 0
+    fi
+
     if [ "$_torch_import_ok" = false ]; then
         _torch_py_ver=$("$_VENV_PY" -c \
             "import sys; print('{}.{}.{}'.format(*sys.version_info[:3]))" 2>/dev/null || echo "unknown")
@@ -4631,7 +4653,9 @@ _torch_import_gate() {
     fi
 }
 
-_torch_import_gate
+# Advisory: diagnoses and repairs, but cannot fail the install, because studio
+# setup has not yet installed the runtime libraries torch links against.
+_torch_import_gate advisory
 
 # ── CI only: overlay a source checkout over the package just installed ──
 # Not a consumer knob: no flag, absent from --help, ignored unless
@@ -4818,11 +4842,13 @@ if [ "$_SETUP_EXIT" -ne 0 ]; then
     exit "$_SETUP_EXIT"
 fi
 
-# Setup succeeded, but it installs Python dependencies of its own and can
-# reinstall torch on the way through, so re-run the gate on the venv as it
-# actually stands. This is the last point where exiting still rolls the previous
-# environment back -- _commit_studio_venv_replacement below drops that copy.
-_torch_import_gate
+# Setup succeeded, and it both installs Python dependencies of its own (it can
+# reinstall torch on the way through) and installs the system runtime libraries
+# torch links against. So this is the first point where a failed import is
+# actually the installer's verdict rather than a not-yet -- and the last point
+# where exiting still rolls the previous environment back, since
+# _commit_studio_venv_replacement below drops that copy.
+_torch_import_gate final
 
 _commit_studio_venv_replacement
 

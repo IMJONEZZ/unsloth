@@ -3474,13 +3474,17 @@ exit 0
     # used Write-Output, a stray uncaptured expression -- would come back as a
     # non-null "result" and abort a perfectly good install.
     function Invoke-TorchImportGate {
+        param([switch]$Final)
         $script:TorchGateFailure = $null
         if ($SkipTorch) { return }
         $torchImport = Test-TorchImport -PythonExe $VenvPython
-        if (-not $torchImport.Ok -and -not $torchImport.TimedOut) {
+        if (-not $torchImport.Ok -and -not $torchImport.TimedOut -and -not $script:TorchRepairDone) {
             substep "[WARN] PyTorch is installed but cannot be imported:" "Yellow"
             substep "[WARN]   $($torchImport.Error)" "Yellow"
             substep "reinstalling PyTorch once before giving up..."
+            # At most one reinstall per run, not one per gate: the gate runs twice
+            # and a wheel that survived the first repair will not be fixed by a second.
+            $script:TorchRepairDone = $true
             # The re-probe is the verdict, not this exit code: a reinstall can report
             # failure over a retried network hiccup and still leave torch importable.
             [void](Invoke-TorchTrioReinstall)
@@ -3494,6 +3498,21 @@ exit 0
             substep "[WARN] so the install is being left in place. If Train is unavailable," "Yellow"
             substep "[WARN] reboot and re-run, or raise UNSLOTH_TORCH_IMPORT_TIMEOUT." "Yellow"
             Write-TauriLog "WARN" "PyTorch import timed out; leaving the install in place"
+        }
+        elseif (-not $torchImport.Ok -and -not $Final) {
+            # Not a verdict yet. studio/setup.ps1 calls Ensure-VCRedist, whose own
+            # comment is "the prebuilt llama.cpp and PyTorch need it", and it has
+            # not run at this point. Failing here would roll the venv back over a
+            # dependency the installer was about to install for itself: on a fresh
+            # Windows host without the VC++ redistributable `import torch` dies on
+            # WinError 126 loading c10.dll until that runtime is present, which is
+            # exactly what a Server Core container reproduces. Say so and continue;
+            # the post-setup call is the one that decides.
+            substep "[WARN] PyTorch cannot be imported yet:" "Yellow"
+            substep "[WARN]   $($torchImport.Error)" "Yellow"
+            substep "[WARN] Studio setup installs the Visual C++ runtime torch needs, so this" "Yellow"
+            substep "[WARN] is re-checked after setup rather than failing the install now." "Yellow"
+            Write-TauriLog "WARN" "PyTorch not importable before studio setup; re-checked afterwards"
         }
         elseif (-not $torchImport.Ok) {
             $torchPyVer = (& $VenvPython -c "import sys; print('{}.{}.{}'.format(*sys.version_info[:3]))" 2>$null | Out-String).Trim()
@@ -3510,6 +3529,8 @@ exit 0
         }
     }
 
+    # Advisory: diagnoses and repairs, but cannot fail the install, because studio
+    # setup has not yet installed the Visual C++ runtime torch links against.
     Invoke-TorchImportGate | Out-Null
     if ($null -ne $script:TorchGateFailure) { return $script:TorchGateFailure }
 
@@ -3714,11 +3735,13 @@ exit 0
     }
     Refresh-SessionPath  # sync current session with registry
 
-    # Setup succeeded, but it installs Python dependencies of its own and can
-    # reinstall torch on the way through, so re-run the gate on the venv as it
-    # actually stands. This is the last point where failing still restores the
-    # previous environment: Complete-StudioVenvRollback below drops that copy.
-    Invoke-TorchImportGate | Out-Null
+    # Setup succeeded, and it both installs Python dependencies of its own (it can
+    # reinstall torch on the way through) and installs the Visual C++ runtime torch
+    # links against. So this is the first point where a failed import is actually
+    # the installer's verdict rather than a not-yet -- and the last point where
+    # failing still restores the previous environment, since
+    # Complete-StudioVenvRollback below drops that copy.
+    Invoke-TorchImportGate -Final | Out-Null
     if ($null -ne $script:TorchGateFailure) { return $script:TorchGateFailure }
 
     Complete-StudioVenvRollback

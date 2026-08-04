@@ -176,6 +176,7 @@ def _gate_script(
     skip_torch: bool,
     probe_results: list[bool],
     probe_timeouts: list[bool] | None = None,
+    advisory_only: bool = False,
 ) -> str:
     """Run the shipped gate with a scripted sequence of probe outcomes."""
     results = ", ".join("$true" if ok else "$false" for ok in probe_results)
@@ -190,10 +191,12 @@ def _gate_script(
     gate = _extract(
         r"    # ── Refuse to finish on a torch that installed but cannot be imported ──"
         r".*?\n    \}\n\n"
+        r"    # Advisory[^\n]*\n(?:    #[^\n]*\n)*"
         r"    Invoke-TorchImportGate \| Out-Null\n"
         r"    if \(\$null -ne \$script:TorchGateFailure\) \{ return \$script:TorchGateFailure \}\n"
     )
     skip = "$true" if skip_torch else "$false"
+    advisory_only = "$true" if advisory_only else "$false"
     return f"""
 $script:ProbeCalls = 0
 $script:RepairCalls = 0
@@ -203,8 +206,14 @@ function Test-TorchImport {{
     param([string]$PythonExe, [int]$TimeoutMs = 0)
     $i = $script:ProbeCalls
     $script:ProbeCalls++
-    $ok = if ($i -lt $script:ProbeResults.Count) {{ $script:ProbeResults[$i] }} else {{ $false }}
-    $to = if ($i -lt $script:ProbeTimeouts.Count) {{ $script:ProbeTimeouts[$i] }} else {{ $false }}
+    # Past the end of the script, hold the last outcome rather than dropping to
+    # $false. A probe reports the state of the venv, and a venv that imported
+    # torch a moment ago does not spontaneously stop -- so the gate's second pass
+    # must see what the first one left behind.
+    $li = [Math]::Min($i, $script:ProbeResults.Count - 1)
+    $ok = if ($li -ge 0) {{ $script:ProbeResults[$li] }} else {{ $false }}
+    $lt = [Math]::Min($i, $script:ProbeTimeouts.Count - 1)
+    $to = if ($lt -ge 0) {{ $script:ProbeTimeouts[$lt] }} else {{ $false }}
     return [pscustomobject]@{{ Ok = $ok; TimedOut = $to; Error = 'ImportError: stubbed failure' }}
 }}
 # Write-Host, not Write-Output, and emitted as it happens. The gate wraps the
@@ -231,6 +240,15 @@ $VenvPython = '/nonexistent/python'
 
 {gate}
 
+# The extracted text above is the advisory pass, exactly as install.ps1 runs it.
+# Unless a test is specifically about that pass, follow it with the authoritative
+# post-setup one -- the real sequence, and why the repair latch matters, since
+# both passes see the same broken wheel.
+if (-not {advisory_only}) {{
+    Invoke-TorchImportGate -Final | Out-Null
+    if ($null -ne $script:TorchGateFailure) {{ Write-Host ("GATE_RETURNED=" + $script:TorchGateFailure); return }}
+}}
+
 Write-Output ("PROBES=" + $script:ProbeCalls)
 Write-Output ("REPAIRS=" + $script:RepairCalls)
 Write-Output "REACHED_END"
@@ -244,7 +262,9 @@ def _run_gate(**kwargs) -> str:
 
 def test_healthy_torch_attempts_no_repair():
     out = _run_gate(skip_torch = False, probe_results = [True])
-    assert "PROBES=1" in out
+    # Two probes, one per pass: the advisory one before studio setup and the
+    # authoritative one after it, since setup can reinstall torch in between.
+    assert "PROBES=2" in out
     assert "REPAIRS=0" in out
     assert "EXIT_FAILURE" not in out
     assert "REACHED_END" in out
@@ -253,7 +273,9 @@ def test_healthy_torch_attempts_no_repair():
 def test_one_repair_is_attempted_and_can_rescue_the_install():
     out = _run_gate(skip_torch = False, probe_results = [False, True])
     assert "REPAIRS=1" in out
-    assert "PROBES=2" in out
+    # Broken, repaired, re-probed in the advisory pass, then confirmed once more
+    # after setup. The repair latch is what keeps that second pass from redoing it.
+    assert "PROBES=3" in out
     assert "EXIT_FAILURE" not in out, "a repaired torch must not fail the install"
     assert "REACHED_END" in out
 
@@ -298,7 +320,9 @@ def test_a_timeout_does_not_fail_the_install():
 def test_a_timeout_attempts_no_repair():
     out = _run_gate(skip_torch = False, probe_results = [False], probe_timeouts = [True])
     assert "REPAIRS=0" in out, "reinstalling cannot unwedge a driver"
-    assert "PROBES=1" in out, "the timeout is the verdict; there is nothing to re-probe"
+    # One probe per pass and no more: within a pass the timeout is the verdict,
+    # so nothing is re-probed and nothing is repaired.
+    assert "PROBES=2" in out
 
 
 def test_a_timeout_says_so_instead_of_blaming_the_wheel():
@@ -311,7 +335,7 @@ def test_a_timeout_says_so_instead_of_blaming_the_wheel():
 def test_a_slow_first_probe_that_then_succeeds_still_finishes():
     """A timeout on probe 1 short-circuits, so a real ImportError still needs probe 2."""
     out = _run_gate(skip_torch = False, probe_results = [False, True], probe_timeouts = [False, False])
-    assert "PROBES=2" in out and "REPAIRS=1" in out
+    assert "PROBES=3" in out and "REPAIRS=1" in out
     assert "EXIT_FAILURE" not in out
 
 
@@ -376,9 +400,9 @@ def test_reinstall_prefers_the_rocm_index_with_pinned_companions():
     )
     assert "reinstall PyTorch (ROCm)" in out
     assert "repo.amd.com/rocm/whl/gfx1151" in out
-    assert (
-        "torchvision>=0.26.0,<0.27.0" in out
-    ), "a bare companion resolves an ABI-incompatible build"
+    assert "torchvision>=0.26.0,<0.27.0" in out, (
+        "a bare companion resolves an ABI-incompatible build"
+    )
 
 
 # ── The auto ROCm reroute sets a torch floor but no companion pins ──
@@ -510,9 +534,23 @@ def test_the_gate_runs_again_after_studio_setup_before_the_venv_is_committed():
     """
     source = _install_ps1()
     calls = [
-        m.start() for m in re.finditer(r"^\s*Invoke-TorchImportGate \| Out-Null$", source, re.M)
+        m.start()
+        for m in re.finditer(r"^\s*Invoke-TorchImportGate( -Final)? \| Out-Null$", source, re.M)
     ]
     assert len(calls) == 2, f"expected the gate to run twice, found {len(calls)}"
+
+    # Which pass may fail the install is the point of the split. Before studio
+    # setup the Visual C++ runtime torch links against is not installed yet
+    # (setup.ps1's Ensure-VCRedist), so a failed import there is a not-yet rather
+    # than a verdict, and failing would roll the venv back over a dependency the
+    # installer was about to install for itself.
+    advisory = re.findall(r"^\s*Invoke-TorchImportGate \| Out-Null$", source, re.M)
+    final = re.findall(r"^\s*Invoke-TorchImportGate -Final \| Out-Null$", source, re.M)
+    assert len(advisory) == 1, "exactly one advisory pass"
+    assert len(final) == 1, "exactly one authoritative pass"
+    assert source.index("Invoke-TorchImportGate | Out-Null") < source.index(
+        "Invoke-TorchImportGate -Final | Out-Null"
+    ), "the advisory pass runs first"
 
     commit = source.index("\n    Complete-StudioVenvRollback")
     assert calls[0] < commit, "the first gate runs during the install phase"
@@ -538,6 +576,32 @@ def test_the_gate_reports_through_a_script_scoped_sentinel_not_its_return_value(
         source.count("if ($null -ne $script:TorchGateFailure) { return $script:TorchGateFailure }")
         == 2
     )
-    assert (
-        "= Invoke-TorchImportGate" not in source
-    ), "the gate's verdict must not be read from its return value"
+    assert "= Invoke-TorchImportGate" not in source, (
+        "the gate's verdict must not be read from its return value"
+    )
+
+
+def test_the_advisory_pass_cannot_fail_the_install():
+    """A fresh Windows host has no Visual C++ redistributable yet.
+
+    `import torch` there dies on `WinError 126` loading `c10.dll` until
+    studio/setup.ps1's Ensure-VCRedist installs the runtime -- which happens
+    after this pass. Failing here would roll the venv back over a dependency the
+    installer was about to install for itself. Confirmed against the real thing:
+    this is what turned the previously-green virgin Server Core container job
+    red before the advisory/authoritative split.
+    """
+    out = _run_gate(skip_torch = False, probe_results = [False, False], advisory_only = True)
+    assert "EXIT_FAILURE" not in out, "the advisory pass must not fail the install"
+    assert "ROLLBACK_RESTORED" not in out, "and must not roll the environment back"
+    assert "re-checked after setup" in out, "it has to say the verdict is deferred"
+    assert "this install is not usable" not in out
+    assert "REACHED_END" in out, "the install continues to studio setup"
+
+
+def test_the_authoritative_pass_still_fails_a_torch_that_setup_could_not_fix():
+    """The control for the test above: deferring must not mean never checking."""
+    out = _run_gate(skip_torch = False, probe_results = [False, False])
+    assert "EXIT_FAILURE: PyTorch is installed but cannot be imported" in out
+    assert "ROLLBACK_RESTORED" in out
+    assert out.count("REPAIR_ATTEMPTED") == 1, "one repair for the whole run, not one per pass"

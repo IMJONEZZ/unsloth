@@ -292,7 +292,12 @@ run_install_cmd_retry() {
     return 0
 }
 set -e
+# Sourcing runs the advisory pass, exactly as install.sh does. GATE_MODE=advisory
+# stops there, to assert that pass cannot fail the install on its own; otherwise
+# the authoritative post-setup pass follows, which is the real sequence -- and it
+# is why the repair latch matters, since both passes see the same broken wheel.
 . "$GATE"
+[ "${GATE_MODE:-final}" = "advisory" ] || _torch_import_gate final
 GATE_RUNNER_EOF
 
     _run_gate() {  # SKIP_TORCH TORCH_INDEX_URL torch_ok_initially repair_works
@@ -400,6 +405,35 @@ GATE_RUNNER_EOF
     assert_eq "an empty LD_LIBRARY_PATH skips the library-path probe entirely" \
         "" "$(cat "$_LD_PROBE_LOG")"
     rm -f "$_LD_PROBE_LOG"
+
+    # A fresh Windows host has no Visual C++ redistributable, so `import torch`
+    # dies on WinError 126 loading c10.dll until studio/setup.ps1's Ensure-VCRedist
+    # installs it -- after this pass. Failing here would roll the venv back over a
+    # dependency the installer was about to install for itself. Verified against
+    # the real thing: this is what turned the previously-green virgin Server Core
+    # container job red before the split.
+    _GATE_OUT_FILE=$(mktemp)
+    _bin=$(mktemp)
+    _marker=$(mktemp); rm -f "$_marker"
+    : > "$_GATE_CALLS"
+    set +e
+    env SKIP_TORCH=false TORCH_INDEX_URL="https://download.pytorch.org/whl/cu128" \
+        REPAIR_WORKS="" TORCH_OK_MARKER="$_marker" CALL_LOG="$_GATE_CALLS" \
+        FAKE_PY_VER="3.13.12" GATE_MODE=advisory \
+        bash "$_GATE_RUNNER" "$_GATE_FILE" "$_bin" > "$_GATE_OUT_FILE" 2>&1
+    _rc=$?
+    set -e
+    rm -f "$_bin" "$_marker"
+    assert_eq "a torch that cannot import yet does not fail the advisory pass" "0" "$_rc"
+    assert_contains "the advisory pass says the check is deferred, not that the install failed" \
+        "$(cat "$_GATE_OUT_FILE")" "re-checked after setup"
+    case "$(cat "$_GATE_OUT_FILE")" in
+        *"this install is not usable"*)
+            assert_eq "the advisory pass does not declare the install unusable" "absent" "present" ;;
+        *)
+            assert_eq "the advisory pass does not declare the install unusable" "absent" "absent" ;;
+    esac
+    rm -f "$_GATE_OUT_FILE"
 
     _GATE_OUT_FILE=$(mktemp)
     _run_gate_wedged && _rc=0 || _rc=$?
@@ -581,9 +615,22 @@ rm -f "$_HELPERS_FILE"
 echo ""
 echo "=== the gate runs again after studio setup ==="
 
-_GATE_CALL_LINES=$(grep -n '^_torch_import_gate$' "$INSTALL_SH" | cut -d: -f1)
+_GATE_CALL_LINES=$(grep -n '^_torch_import_gate \(advisory\|final\)$' "$INSTALL_SH" | cut -d: -f1)
 _GATE_CALL_COUNT=$(printf '%s\n' "$_GATE_CALL_LINES" | grep -c . || true)
 assert_eq "the gate is invoked exactly twice" "2" "$_GATE_CALL_COUNT"
+
+# Which pass may fail the install is the whole point of the split: before studio
+# setup the runtime libraries torch links against are not installed yet (on
+# Windows setup.ps1's Ensure-VCRedist), so a failed import there is a not-yet,
+# not a verdict. Getting these the wrong way round would roll back a working
+# environment on any fresh host that lacks the VC++ redistributable.
+assert_eq "the pre-setup pass is advisory" "1" \
+    "$(grep -c '^_torch_import_gate advisory$' "$INSTALL_SH")"
+assert_eq "the post-setup pass is the authoritative one" "1" \
+    "$(grep -c '^_torch_import_gate final$' "$INSTALL_SH")"
+assert_eq "the advisory pass comes first" \
+    "$(grep -n '^_torch_import_gate advisory$' "$INSTALL_SH" | cut -d: -f1)" \
+    "$(printf '%s\n' "$_GATE_CALL_LINES" | head -1)"
 
 _COMMIT_LINE=$(grep -n '^_commit_studio_venv_replacement$' "$INSTALL_SH" | cut -d: -f1 | head -1)
 _SETUP_LINE=$(grep -n '^if \[ "\$_SETUP_EXIT" -ne 0 \]; then$' "$INSTALL_SH" | cut -d: -f1 | head -1)
