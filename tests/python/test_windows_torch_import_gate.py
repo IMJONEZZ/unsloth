@@ -293,9 +293,7 @@ def test_a_timeout_says_so_instead_of_blaming_the_wheel():
 
 def test_a_slow_first_probe_that_then_succeeds_still_finishes():
     """A timeout on probe 1 short-circuits, so a real ImportError still needs probe 2."""
-    out = _run_gate(
-        skip_torch = False, probe_results = [False, True], probe_timeouts = [False, False]
-    )
+    out = _run_gate(skip_torch = False, probe_results = [False, True], probe_timeouts = [False, False])
     assert "PROBES=2" in out and "REPAIRS=1" in out
     assert "EXIT_FAILURE" not in out
 
@@ -343,9 +341,9 @@ def test_reinstall_prefers_the_rocm_index_with_pinned_companions():
     )
     assert "reinstall PyTorch (ROCm)" in out
     assert "repo.amd.com/rocm/whl/gfx1151" in out
-    assert (
-        "torchvision>=0.26.0,<0.27.0" in out
-    ), "a bare companion resolves an ABI-incompatible build"
+    assert "torchvision>=0.26.0,<0.27.0" in out, (
+        "a bare companion resolves an ABI-incompatible build"
+    )
 
 
 def test_reinstall_uses_the_resolved_cuda_index_when_there_is_no_rocm_one():
