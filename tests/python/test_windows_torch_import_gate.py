@@ -201,6 +201,26 @@ def test_a_wedged_probe_still_returns_promptly(tmp_path):
     )
 
 
+def test_the_final_gate_runs_before_the_launcher_shim_is_refreshed():
+    """A failed gate rolls the venv back, and nothing else.
+
+    Restore-StudioVenvRollback moves the venv directories; it does not touch
+    $StudioHome\\bin\\unsloth.exe. Refreshing that shim first would leave PATH
+    pointing at a hardlink to the failed upgrade's console script while the
+    restored venv is the one that works.
+    """
+    source = _install_ps1()
+    gate_at = source.index("Invoke-TorchImportGate -Final")
+    shim_at = source.index('$ShimExe = Join-Path $ShimDir "unsloth.exe"')
+    setup_at = source.index('Clear-TauriInstallError "studio setup completed"')
+
+    assert setup_at < gate_at, (
+        "the final gate has to follow studio setup, which is what installs the "
+        "runtime libraries torch links against"
+    )
+    assert gate_at < shim_at, "the gate has to run before the shim is replaced"
+
+
 def test_a_grandchild_holding_the_pipes_does_not_stall_the_probe(tmp_path):
     """The launcher is not always the process that holds the handles.
 

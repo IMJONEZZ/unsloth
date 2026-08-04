@@ -3656,6 +3656,18 @@ exit 0
     }
     Clear-TauriInstallError "studio setup completed"
 
+    # Setup succeeded, and it both reinstalls torch on the way through and installs
+    # the Visual C++ runtime torch links against. So this is the first point where a
+    # failed import is a verdict rather than a not-yet, and the last where failing
+    # still restores the previous environment, since Complete-StudioVenvRollback
+    # further down drops that copy.
+    #
+    # Before the launcher shim, not after: Restore-StudioVenvRollback only moves the
+    # venv directories back, so a shim refreshed first would stay a hardlink to the
+    # failed upgrade's console script while PATH points at it.
+    Invoke-TorchImportGate -Final | Out-Null
+    if ($null -ne $script:TorchGateFailure) { return $script:TorchGateFailure }
+
     # ── Expose `unsloth` via a shim dir containing only unsloth.exe ──
     # We do NOT add the venv Scripts dir to PATH (it also holds python.exe
     # and pip.exe, which would hijack the user's system interpreter).
@@ -3741,14 +3753,6 @@ exit 0
         step "path" "added unsloth launcher to PATH"
     }
     Refresh-SessionPath  # sync current session with registry
-
-    # Setup succeeded, and it both reinstalls torch on the way through and installs
-    # the Visual C++ runtime torch links against. So this is the first point where a
-    # failed import is a verdict rather than a not-yet, and the last where failing
-    # still restores the previous environment, since Complete-StudioVenvRollback
-    # below drops that copy.
-    Invoke-TorchImportGate -Final | Out-Null
-    if ($null -ne $script:TorchGateFailure) { return $script:TorchGateFailure }
 
     Complete-StudioVenvRollback
     $studioVenvReplacementCommitted = $true
