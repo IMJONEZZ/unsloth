@@ -265,9 +265,9 @@ def test_reinstall_prefers_the_rocm_index_with_pinned_companions():
     )
     assert "reinstall PyTorch (ROCm)" in out
     assert "repo.amd.com/rocm/whl/gfx1151" in out
-    assert "torchvision>=0.26.0,<0.27.0" in out, (
-        "a bare companion resolves an ABI-incompatible build"
-    )
+    assert (
+        "torchvision>=0.26.0,<0.27.0" in out
+    ), "a bare companion resolves an ABI-incompatible build"
 
 
 def test_reinstall_uses_the_resolved_cuda_index_when_there_is_no_rocm_one():
