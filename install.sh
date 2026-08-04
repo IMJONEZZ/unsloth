@@ -4434,14 +4434,36 @@ _reinstall_torch_trio() {
     fi
 }
 
-if [ "$SKIP_TORCH" = false ]; then
-    if "$_VENV_PY" -c "import torch" >/dev/null 2>&1; then
-        _torch_import_ok=true
+# `import torch` can block forever rather than fail -- a wedged Intel driver is
+# the known case, which is why _PREV_TORCH_VER above reads version.py off disk
+# instead of starting an interpreter. This gate has to run the import for real,
+# so bound it. Not _run_bounded: its 10s is sized for nvidia-smi, and a cold
+# first import of the CUDA libraries legitimately takes far longer.
+#
+# 124 is timeout(1)'s "killed on time", which is a different verdict from any
+# other non-zero exit: the import never reported anything, so we have not learned
+# that torch is broken. Reinstalling cannot unwedge a driver, and failing would
+# roll back a venv that is probably fine, so a timeout warns and continues while
+# a real ImportError still fails the install.
+_TORCH_IMPORT_TIMEOUT="${UNSLOTH_TORCH_IMPORT_TIMEOUT:-180}"
+_torch_import_probe() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$_TORCH_IMPORT_TIMEOUT" "$_VENV_PY" -c "import torch" >/dev/null 2>&1
     else
-        _torch_import_ok=false
+        "$_VENV_PY" -c "import torch" >/dev/null 2>&1
+    fi
+}
+
+if [ "$SKIP_TORCH" = false ]; then
+    _torch_import_ok=false
+    _torch_import_timed_out=false
+    if _torch_import_probe; then
+        _torch_import_ok=true
+    elif [ "$?" = 124 ]; then
+        _torch_import_timed_out=true
     fi
 
-    if [ "$_torch_import_ok" = false ]; then
+    if [ "$_torch_import_ok" = false ] && [ "$_torch_import_timed_out" = false ]; then
         # Re-run only to capture the message: a healthy torch can still write to
         # stderr, so the exit status above is the test and this is the diagnosis.
         _torch_import_err=$("$_VENV_PY" -c "import torch" 2>&1 >/dev/null || true)
@@ -4451,9 +4473,19 @@ if [ "$SKIP_TORCH" = false ]; then
         # `|| true`: the import re-probe below is the verdict, not the reinstall's
         # exit code, and set -e must not abort before that probe runs.
         _reinstall_torch_trio || true
-        if "$_VENV_PY" -c "import torch" >/dev/null 2>&1; then
+        if _torch_import_probe; then
             _torch_import_ok=true
+        elif [ "$?" = 124 ]; then
+            _torch_import_timed_out=true
         fi
+    fi
+
+    if [ "$_torch_import_timed_out" = true ]; then
+        substep "[WARN] PyTorch did not finish importing within ${_TORCH_IMPORT_TIMEOUT}s." "$C_WARN"
+        substep "[WARN] That usually means a wedged GPU driver rather than a bad install," "$C_WARN"
+        substep "[WARN] so the install is being left in place. If Train is unavailable," "$C_WARN"
+        substep "[WARN] reboot and re-run, or raise UNSLOTH_TORCH_IMPORT_TIMEOUT." "$C_WARN"
+        _torch_import_ok=true
     fi
 
     if [ "$_torch_import_ok" = false ]; then

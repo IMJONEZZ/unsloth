@@ -180,7 +180,9 @@ else
     cat > "$_GATE_RUNNER" << 'GATE_RUNNER_EOF'
 GATE="$1"; VENV_BIN="$2"
 step()      { :; }
-substep()   { :; }
+# Echoed, not swallowed: the wedge case asserts on the warning text. Every other
+# gate case redirects this away and asserts on the exit code and the call log.
+substep()   { printf '%s\n' "$1"; }
 tauri_log() { :; }
 # A fake interpreter whose `import torch` succeeds only once the marker exists,
 # modelling a wheel that is present but unimportable until repaired.
@@ -188,6 +190,8 @@ cat > "$VENV_BIN" << 'PY_EOF'
 #!/usr/bin/env bash
 case "$2" in
     *"import torch"*)
+        # A wedged GPU driver blocks the import instead of failing it.
+        if [ -n "$TORCH_WEDGE" ]; then sleep 30; exit 0; fi
         if [ -f "$TORCH_OK_MARKER" ]; then exit 0; fi
         echo "IndentationError: expected an indented block after function definition on line 4" >&2
         exit 1 ;;
@@ -254,6 +258,38 @@ GATE_RUNNER_EOF
     _run_gate true "https://download.pytorch.org/whl/cu128" broken "" && _rc=0 || _rc=$?
     assert_eq "--no-torch (SKIP_TORCH=true) skips the gate entirely" "0" "$_rc"
     assert_eq "--no-torch attempts no repair" "" "$(cat "$_GATE_CALLS")"
+
+    # A wedged driver makes `import torch` hang rather than fail. main moved
+    # _PREV_TORCH_VER off the interpreter for exactly this reason (#7706), so the
+    # gate -- which must run the import for real -- has to bound it. A timeout is
+    # not evidence that torch is broken: reinstalling cannot unwedge a driver and
+    # failing would roll back a venv that is probably fine.
+    _run_gate_wedged() {
+        _bin=$(mktemp)
+        _marker=$(mktemp); rm -f "$_marker"
+        : > "$_GATE_CALLS"
+        set +e
+        env SKIP_TORCH=false TORCH_INDEX_URL="https://download.pytorch.org/whl/cu128" \
+            REPAIR_WORKS="" TORCH_OK_MARKER="$_marker" CALL_LOG="$_GATE_CALLS" \
+            FAKE_PY_VER="3.13.12" TORCH_WEDGE=1 UNSLOTH_TORCH_IMPORT_TIMEOUT=2 \
+            bash "$_GATE_RUNNER" "$_GATE_FILE" "$_bin" > "$_GATE_OUT_FILE" 2>&1
+        _rc=$?
+        set -e
+        rm -f "$_bin" "$_marker"
+        return $_rc
+    }
+
+    _GATE_OUT_FILE=$(mktemp)
+    if command -v timeout >/dev/null 2>&1; then
+        _run_gate_wedged && _rc=0 || _rc=$?
+        assert_eq "a wedged import does not fail the install" "0" "$_rc"
+        assert_eq "a wedged import attempts no repair" "" "$(cat "$_GATE_CALLS")"
+        assert_contains "a wedged import says so instead of blaming the wheel" \
+            "$(cat "$_GATE_OUT_FILE")" "did not finish importing"
+    else
+        echo "  SKIP: timeout(1) unavailable, cannot exercise the wedge path"
+    fi
+    rm -f "$_GATE_OUT_FILE"
 
     rm -f "$_GATE_RUNNER" "$_GATE_CALLS"
 fi
