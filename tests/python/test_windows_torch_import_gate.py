@@ -166,8 +166,8 @@ def test_a_timed_out_probe_is_waited_out_before_the_installer_moves_on():
     blocks, which is the deadlock the async reads exist to avoid.
     """
     probe = _extract(r"    function Test-TorchImport \{.*?\n    \}\n")
-    branch = probe[probe.index("if (-not $finished)"):]
-    branch = branch[:branch.index("return [pscustomobject]")]
+    branch = probe[probe.index("if (-not $finished)") :]
+    branch = branch[: branch.index("return [pscustomobject]")]
 
     kill_at = branch.index(".Kill()")
     wait_at = branch.index("WaitForExit(")
