@@ -48,9 +48,9 @@ def _uv_block() -> str:
         source,
         flags = re.DOTALL,
     )
-    assert match is not None, (
-        "install.ps1 uv block not found; the offline guard cannot be verified."
-    )
+    assert (
+        match is not None
+    ), "install.ps1 uv block not found; the offline guard cannot be verified."
     return match.group(0)
 
 
