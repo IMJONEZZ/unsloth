@@ -265,12 +265,20 @@ case "$2" in
         # does not exist either -- nothing bounds this. A native crash inside a
         # CUDA/ROCm library exits 139/134, not 3.
         if [ -n "${PROBE_RC:-}" ] && [ -n "$_probe" ]; then
+            # The watchdog announces itself before _exit(1)ing; PROBE_BANNER= drops that
+            # line, which is how an interpreter that died at status 1 without ever
+            # arming a deadline looks.
+            if [ "${PROBE_BANNER:-1}" = 1 ]; then
+                printf 'Timeout (0:00:02)!\n' >&2
+            fi
             printf 'simulated exit %s\n' "$PROBE_RC" >&2
             exit "$PROBE_RC"
         fi
         if [ -n "$TORCH_WEDGE" ]; then
             if [ -n "$_probe" ] && [ -n "$_deadline" ] && [ "$_deadline" -gt 0 ]; then
-                sleep "$_deadline"; exit 1
+                sleep "$_deadline"
+                printf 'Timeout (0:00:0%s)!\n' "$_deadline" >&2
+                exit 1
             fi
             sleep 30; exit 0
         fi
@@ -454,12 +462,13 @@ GATE_RUNNER_EOF
     # A SIGSEGV/SIGABRT in a CUDA or ROCm library exits 139/134 and an interpreter
     # that will not start exits 127: those say torch is broken, and continuing on
     # them would commit a venv whose torch demonstrably crashed.
-    _run_gate_rc() {  # exit status the probe should report
+    _run_gate_rc() {  # exit status the probe should report, whether it printed the banner
         _bin=$(mktemp); _marker=$(mktemp); rm -f "$_marker"; : > "$_GATE_CALLS"
         set +e
         env SKIP_TORCH=false TORCH_INDEX_URL="https://download.pytorch.org/whl/cu128" \
             REPAIR_WORKS="" TORCH_OK_MARKER="$_marker" CALL_LOG="$_GATE_CALLS" \
-            FAKE_PY_VER="3.13.12" PROBE_RC="$1" UNSLOTH_TORCH_IMPORT_TIMEOUT=2 \
+            FAKE_PY_VER="3.13.12" PROBE_RC="$1" PROBE_BANNER="${2:-1}" \
+            UNSLOTH_TORCH_IMPORT_TIMEOUT=2 \
             bash "$_GATE_RUNNER" "$_GATE_FILE" "$_bin" > /dev/null 2>&1
         _rc=$?
         set -e
@@ -477,6 +486,17 @@ GATE_RUNNER_EOF
         assert_eq "probe exit $_rc_case repairs once first" \
             "1" "$(grep -c 'repair-' "$_GATE_CALLS")"
     done
+
+    # Status 1 is the watchdog's, but not only the watchdog's: an interpreter that
+    # cannot run the snippet at all -- no working faulthandler, a python that dies on
+    # startup -- also exits 1, having never imported torch. Reading that as a timeout
+    # would skip the repair and commit the venv, which is the silent success this gate
+    # exists to stop, so the watchdog's banner has to be there too.
+    _run_gate_rc 1 0 && _rc=0 || _rc=$?
+    assert_eq "exit 1 without the watchdog banner is a broken torch, not a timeout" \
+        "1" "$_rc"
+    assert_eq "exit 1 without the banner still gets its one repair" \
+        "1" "$(grep -c 'repair-' "$_GATE_CALLS")"
 
     # The advisory pass diagnoses but must not repair: before studio setup the
     # runtime libraries torch links against may not exist yet and a reinstall cannot

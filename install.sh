@@ -4530,17 +4530,27 @@ esac
 # traceback is printed so the diagnostic below can read it off this same bounded run:
 # a bare `import torch` to collect the message would be unbounded and skip
 # _torch_probe_exec, hanging the installer while merely composing an error string.
+#
+# Arming is inside its own try: an interpreter without a working faulthandler would
+# otherwise die here with status 1, which is the watchdog's own status and would read
+# as a timeout on an import that never happened. Losing the in-Python bound is the
+# lesser fault -- timeout(1) still covers it where it exists.
 _torch_probe_py() {
     printf '%s\n' "
-import faulthandler, sys, traceback
-if $_TORCH_IMPORT_TIMEOUT > 0:
-    faulthandler.dump_traceback_later($_TORCH_IMPORT_TIMEOUT, exit = True)
+import sys, traceback
+try:
+    import faulthandler
+    if $_TORCH_IMPORT_TIMEOUT > 0:
+        faulthandler.dump_traceback_later($_TORCH_IMPORT_TIMEOUT, exit = True)
+except BaseException:
+    faulthandler = None
 try:
     import torch
 except BaseException:
     traceback.print_exc()
     sys.exit(3)
-faulthandler.cancel_dump_traceback_later()
+if faulthandler is not None:
+    faulthandler.cancel_dump_traceback_later()
 sys.exit(0)
 "
 }
@@ -4556,22 +4566,31 @@ _torch_probe_run() {
     fi
 }
 
+# Keeps the probe's stderr, so the verdict and the message come from the one bounded
+# run rather than from a second import of a torch that may be wedged.
+_TORCH_PROBE_STDERR=""
 _torch_import_probe() {
-    _torch_probe_run >/dev/null 2>&1
+    _TORCH_PROBE_STDERR=$(_torch_probe_run 2>&1 >/dev/null)
 }
 
-# Only two statuses mean "no verdict": 1 from faulthandler's watchdog, which _exit(1)s
-# after dumping, and 124 from timeout(1). Everything else (3 for a caught import
-# error, 139/134 for a SIGSEGV/SIGABRT inside a CUDA or ROCm library, 127 for an
-# interpreter that will not start) is the probe telling us torch is broken. Treating
-# those as timeouts would warn and commit the venv, the silent success this gate stops.
-_torch_probe_timed_out() {
-    [ "$1" = "1" ] || [ "$1" = "124" ]
-}
-
-# The failure text, collected under the same bounds and the same library path.
-_torch_import_error() {
-    _torch_probe_run 2>&1 >/dev/null || true
+# Only two statuses mean "no verdict": 124 from timeout(1), and 1 from faulthandler's
+# watchdog, which _exit(1)s after dumping. Status 1 is not the watchdog's alone -- an
+# interpreter that cannot run the snippet at all exits 1 too, having imported nothing --
+# so it counts only alongside the watchdog's own banner. CPython writes
+# "Timeout (h:mm:ss)!" from faulthandler_thread() immediately before that _exit(1), and
+# builds it with a C format string, so it is not localised.
+#
+# Everything else (3 for a caught import error, 139/134 for a SIGSEGV/SIGABRT inside a
+# CUDA or ROCm library, 127 for an interpreter that will not start) is the probe telling
+# us torch is broken. Treating those as timeouts would warn and commit the venv, the
+# silent success this gate stops.
+_torch_probe_timed_out() {  # exit status, probe stderr
+    case "$1" in
+        124) return 0 ;;
+        1) ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "$2" | grep -q 'Timeout ('
 }
 
 # Runs twice: once here, once after studio setup. Setup is not read-only --
@@ -4588,7 +4607,7 @@ _torch_import_gate() {
     _torch_import_probe || _torch_probe_rc=$?
     if [ "$_torch_probe_rc" = 0 ]; then
         _torch_import_ok=true
-    elif _torch_probe_timed_out "$_torch_probe_rc"; then
+    elif _torch_probe_timed_out "$_torch_probe_rc" "$_TORCH_PROBE_STDERR"; then
         _torch_import_timed_out=true
     fi
 
@@ -4600,8 +4619,8 @@ _torch_import_gate() {
     if [ "$1" = "final" ] && [ "$_torch_import_ok" = false ] &&
         [ "$_torch_import_timed_out" = false ] && [ "$_TORCH_REPAIR_DONE" = false ]; then
         # A healthy torch still writes to stderr, so the exit status above is the
-        # test and this re-run only supplies the message.
-        _torch_import_err=$(_torch_import_error)
+        # test and this text is only the message.
+        _torch_import_err=$_TORCH_PROBE_STDERR
         substep "[WARN] PyTorch is installed but cannot be imported:" "$C_WARN"
         substep "[WARN]   $_torch_import_err" "$C_WARN"
         substep "reinstalling PyTorch once before giving up..."
@@ -4620,7 +4639,7 @@ _torch_import_gate() {
         _torch_import_probe || _torch_probe_rc=$?
         if [ "$_torch_probe_rc" = 0 ]; then
             _torch_import_ok=true
-        elif _torch_probe_timed_out "$_torch_probe_rc"; then
+        elif _torch_probe_timed_out "$_torch_probe_rc" "$_TORCH_PROBE_STDERR"; then
             _torch_import_timed_out=true
         fi
     fi
@@ -4640,7 +4659,7 @@ _torch_import_gate() {
         # until that runtime is present, so failing here would roll back over a
         # dependency the installer is about to install itself. The post-setup call
         # decides.
-        _torch_import_err=$(_torch_import_error)
+        _torch_import_err=$_TORCH_PROBE_STDERR
         substep "[WARN] PyTorch cannot be imported yet:" "$C_WARN"
         substep "[WARN]   $_torch_import_err" "$C_WARN"
         substep "[WARN] Studio setup installs runtime libraries torch needs, so this is" "$C_WARN"
@@ -4651,7 +4670,7 @@ _torch_import_gate() {
     if [ "$_torch_import_ok" = false ]; then
         _torch_py_ver=$("$_VENV_PY" -c \
             "import sys; print('{}.{}.{}'.format(*sys.version_info[:3]))" 2>/dev/null || echo "unknown")
-        _torch_import_err=$(_torch_import_error)
+        _torch_import_err=$_TORCH_PROBE_STDERR
         tauri_log "ERROR" "PyTorch is installed but cannot be imported"
         step "error" "PyTorch is installed but cannot be imported" "$C_ERR"
         substep "Python:  $_torch_py_ver"

@@ -2915,10 +2915,27 @@ exit 0
             $errTask = $proc.StandardError.ReadToEndAsync()
             $finished = $proc.WaitForExit($TimeoutMs)
             if (-not $finished) {
-                try { $proc.Kill() } catch {}
+                $killed = $true
+                try { $proc.Kill() } catch { $killed = $false }
+                # Kill() only asks. Returning while the process is still dying leaves it
+                # holding torch\lib and nvidia\*\lib DLLs, and on Windows the uv
+                # reinstalls that follow fail on a locked file -- rolling back a venv
+                # that was probably fine. Bounded, because an import wedged in a driver
+                # ioctl can outlive the request.
+                $exited = $false
+                if ($killed) { $exited = $proc.WaitForExit(15000) }
+                if ($exited) {
+                    # Drain the redirected pipes so the reader tasks and their handles go
+                    # with the process. Only once it has exited: while it is alive these
+                    # block, which is the deadlock the async reads exist to avoid.
+                    try { [void]$outTask.GetAwaiter().GetResult() } catch {}
+                    try { [void]$errTask.GetAwaiter().GetResult() } catch {}
+                }
                 # Floor, not [int]: PowerShell rounds .5 to even, so a 1.5s budget would report 2s.
                 $killedAfter = [math]::Floor($TimeoutMs / 1000)
-                return [pscustomobject]@{ Ok = $false; TimedOut = $true; Error = "import torch did not finish within ${killedAfter}s" }
+                $detail = "import torch did not finish within ${killedAfter}s"
+                if (-not $exited) { $detail += " and is still running; a reinstall may hit locked files" }
+                return [pscustomobject]@{ Ok = $false; TimedOut = $true; Error = $detail }
             }
             [void]$outTask.GetAwaiter().GetResult()
             $stderr = $errTask.GetAwaiter().GetResult().Trim()

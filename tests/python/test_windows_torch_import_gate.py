@@ -22,6 +22,7 @@ import re
 import sys
 import textwrap
 import shutil
+import time
 import stat
 import subprocess
 from pathlib import Path
@@ -153,6 +154,45 @@ def test_a_wedged_import_is_killed_rather_than_hanging(tmp_path):
     assert "OK=False" in out
     assert "did not finish within 1s" in out
     assert "TIMEDOUT=True" in out, "the caller cannot tell a wedged driver from a broken wheel"
+
+
+def test_a_timed_out_probe_is_waited_out_before_the_installer_moves_on():
+    """Kill() only asks; termination is asynchronous.
+
+    Returning while the process is still dying leaves it holding torch\\lib and
+    nvidia\\*\\lib DLLs, and the uv reinstalls that follow fail on a locked file --
+    rolling back a venv that was probably fine. The wait has to be bounded and the
+    pipes drained, and the drain has to come after the exit: draining a live child
+    blocks, which is the deadlock the async reads exist to avoid.
+    """
+    probe = _extract(r"    function Test-TorchImport \{.*?\n    \}\n")
+    branch = probe[probe.index("if (-not $finished)"):]
+    branch = branch[:branch.index("return [pscustomobject]")]
+
+    kill_at = branch.index(".Kill()")
+    wait_at = branch.index("WaitForExit(")
+    assert kill_at < wait_at, "the wait has to follow the kill"
+    assert re.search(r"WaitForExit\(\s*\d+\s*\)", branch), (
+        "an unbounded WaitForExit() here hangs the installer on the very process "
+        "that already proved it does not finish"
+    )
+    drain_at = branch.index("GetAwaiter().GetResult()")
+    assert wait_at < drain_at, "draining a process that has not exited blocks"
+    assert branch.count("GetAwaiter().GetResult()") == 2, "both pipes have to be drained"
+
+
+def test_a_wedged_probe_still_returns_promptly(tmp_path):
+    # The wait added above is a bound, not a second timeout: a child that dies when
+    # asked must not add to the budget the caller already spent.
+    py = _fake_python(tmp_path, "python_hangs_twice", "time.sleep(30)")
+    started = time.monotonic()
+    out = _pwsh(_probe_script(str(py), timeout_ms = 1500))
+    elapsed = time.monotonic() - started
+    assert "TIMEDOUT=True" in out
+    assert elapsed < 20, (
+        f"the timeout path took {elapsed:.1f}s; the post-kill wait is meant to be "
+        "the exception, not the rule"
+    )
 
 
 def test_a_real_import_failure_is_not_reported_as_a_timeout(tmp_path):
