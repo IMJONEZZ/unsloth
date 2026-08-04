@@ -48,9 +48,9 @@ def _uv_block() -> str:
         source,
         flags = re.DOTALL,
     )
-    assert (
-        match is not None
-    ), "install.ps1 uv block not found; the offline guard cannot be verified."
+    assert match is not None, (
+        "install.ps1 uv block not found; the offline guard cannot be verified."
+    )
     return match.group(0)
 
 
@@ -78,10 +78,12 @@ function step         {{ param($a, $b, $c) Write-Output "STEP: $a $b" }}
 function Write-TauriLog {{ param($a, $b) }}
 function Refresh-SessionPath {{ }}
 function Exit-InstallFailure {{ param($m) Write-Output "EXIT-FAILURE: $m"; return 1 }}
-# Offline: the download itself raises, which under "Stop" is script-terminating.
-# [Console]::Out, not Write-Output: the call site is Invoke-Expression (Invoke-RestMethod ...),
-# so anything on the pipeline becomes an argument instead of reaching stdout.
-function Invoke-RestMethod {{ param($Uri) [Console]::Out.WriteLine("DOWNLOAD-ATTEMPTED"); throw "no route to host" }}
+# Offline: the download itself raises, which under "Stop" is script-terminating
+# unless Install-UvFromRelease catches it. [Console]::Out, not Write-Output, so the
+# marker reaches stdout rather than becoming a pipeline value inside the function.
+function Invoke-WebRequest {{ param($Uri, $OutFile, [switch]$UseBasicParsing) [Console]::Out.WriteLine("DOWNLOAD-ATTEMPTED"); throw "no route to host" }}
+function Get-HostMachineArch {{ "x86_64" }}
+function Add-ToUserPath {{ param($Directory, $Position) $true }}
 $script:WingetAvailable = $false
 $env:PATH = "{bindir}"
 $env:USERPROFILE = "{home}"
@@ -131,17 +133,25 @@ def test_a_new_enough_uv_downloads_nothing(tmp_path):
     assert "continuing with the installed uv" not in out, out
 
 
-def test_the_astral_fallback_cannot_escape_as_a_terminating_error():
-    """The bare Invoke-RestMethod is what escaped past the rollback; keep it wrapped."""
+def test_the_release_download_cannot_escape_as_a_terminating_error():
+    """The pinned-release download is what would escape past the rollback; keep it wrapped.
+
+    main #7819 replaced the in-process `Invoke-Expression (Invoke-RestMethod ...)`
+    with Install-UvFromRelease, which fetches a pinned-SHA archive. The invariant is
+    unchanged and is the whole point of this file: the block runs under
+    $ErrorActionPreference = "Stop", so an unreachable host must surface as a return
+    value, not a script-terminating error that skips Exit-InstallFailure and leaves
+    the venv unrolled-back.
+    """
     block = _uv_block()
-    astral = re.search(
-        r"installing uv via https://astral\.sh/uv/install\.ps1.*?Refresh-SessionPath",
+    fetch = re.search(
+        r"foreach \(\$base in \$uvBase\).*?if \(-not \$downloaded\) \{ return \$false \}",
         block,
         flags = re.DOTALL,
     )
-    assert astral is not None, block
-    assert "try {" in astral.group(0) and "catch" in astral.group(0), (
-        "Invoke-RestMethod runs under $ErrorActionPreference = 'Stop'; uncaught, an "
+    assert fetch is not None, block
+    assert "try {" in fetch.group(0) and "catch" in fetch.group(0), (
+        "Invoke-WebRequest runs under $ErrorActionPreference = 'Stop'; uncaught, an "
         "offline host terminates the script before Exit-InstallFailure can roll the "
-        f"venv back. Found:\n{astral.group(0)}"
+        f"venv back. Found:\n{fetch.group(0)}"
     )
