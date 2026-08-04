@@ -383,7 +383,9 @@ export function AppSidebar() {
         ? "Training needs Apple Silicon or a GPU. Intel Macs are chat-only."
         : chatOnlyReason === "no_gpu"
           ? "Training needs an NVIDIA or AMD GPU."
-          : undefined;
+          : chatOnlyReason === "detection_failed"
+            ? "PyTorch is installed but failed to import, so this host was never measured. Re-run the installer to repair it."
+            : undefined;
 
   // The backend MLX self-heal (utils/mlx_repair) can reinstall MLX in the
   // background and flip chat_only false without a restart. The platform store
@@ -393,7 +395,16 @@ export function AppSidebar() {
   useEffect(() => {
     // Also while deferred: under the kill switch health settles nothing, so only a
     // first-use operation detects and a GPU host would stay chat-only until a refresh.
-    if (!chatOnly || (chatOnlyReason !== "mlx_unavailable" && !detectionDeferred)) return;
+    // detection_failed is recoverable the same way: a broken torch import is usually
+    // repaired by re-running the installer against the same tree, and without this the
+    // user would sit on a greyed-out Train until they restarted Studio by hand.
+    if (
+      !chatOnly ||
+      (chatOnlyReason !== "mlx_unavailable" &&
+        chatOnlyReason !== "detection_failed" &&
+        !detectionDeferred)
+    )
+      return;
     const id = window.setInterval(() => {
       void fetchDeviceType({ force: true }).catch(() => undefined);
     }, 15000);

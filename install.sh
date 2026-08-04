@@ -2208,7 +2208,15 @@ esac
 
 # ── Install uv ──
 tauri_log "STEP" "Installing uv package manager"
-UV_MIN_VERSION="0.8.16"
+# 0.9.3 is the first uv whose managed-Python manifest contains CPython 3.13.9.
+# Anything older tops out at 3.13.8, which cannot import torch: CPython
+# gh-139783 makes inspect.getsourcelines() mis-parse a decorator followed by a
+# comment, and torch/nn/modules/rnn.py has that exact shape in the
+# @_overload_method blocks it parses at import time. A bare "3.13" request on an
+# older uv therefore resolves straight to the broken patch, which is why this
+# floor -- not the interpreter guard below -- is the actual fix; the guard only
+# repairs a venv that still slipped through.
+UV_MIN_VERSION="0.9.3"
 
 # When bytecode compilation is enabled, large installs can exceed uv's 60s default on slow machines. Default to 180s, preserving overrides ("0" disables).
 : "${UV_COMPILE_BYTECODE_TIMEOUT:=180}"
@@ -2226,7 +2234,7 @@ export UV_HTTP_TIMEOUT
 # present their own CA certificate. rustls (uv's default) ignores the Keychain
 # and rejects intercepted connections with "invalid peer certificate: UnknownIssuer".
 # Set both vars: UV_SYSTEM_CERTS is the modern one (uv >= 0.11), UV_NATIVE_TLS the
-# legacy one understood by uv 0.8.16-0.10.x, which the installer keeps if already
+# legacy one understood by uv 0.9.3-0.10.x, which the installer keeps if already
 # present (UV_MIN_VERSION) and which ignores UV_SYSTEM_CERTS. Mirror the choice onto
 # both so it works on either uv. Opt out with UV_SYSTEM_CERTS=0.
 if [ "$OS" = "macos" ]; then
@@ -2275,6 +2283,21 @@ _uv_version_ok() {
     return 0
 }
 
+# uv interpreter request for the version or version range in $1. Apple Silicon
+# needs the arch-explicit triple or uv can satisfy the request from a cached
+# x86_64 (Rosetta) build, and torch has shipped no macOS x86_64 wheels since
+# 2.2.2. Every other platform takes the request bare so uv resolves its own
+# native download -- the macOS triple must never leak onto Linux. uv parses a
+# PEP 440 specifier in either shape, so "cpython->=3.13.9,<3.14-macos-aarch64-none"
+# resolves the same interpreter as ">=3.13.9,<3.14".
+_uv_python_spec() {
+    if [ "$OS" = "macos" ] && [ "$_ARCH" = "arm64" ]; then
+        echo "cpython-$1-macos-aarch64-none"
+    else
+        echo "$1"
+    fi
+}
+
 if ! command -v uv >/dev/null 2>&1 || ! _uv_version_ok uv; then
     substep "installing uv package manager..."
     _uv_tmp=$(mktemp)
@@ -2285,6 +2308,13 @@ if ! command -v uv >/dev/null 2>&1 || ! _uv_version_ok uv; then
         . "$HOME/.local/bin/env"
     fi
     export PATH="$HOME/.local/bin:$PATH"
+    # Astral's installer can exit 0 and still leave an older uv first on PATH (a
+    # distro package, a shell alias, a read-only ~/.local/bin). Say so here: the
+    # venv guard below still repairs the result, but the guard firing should not
+    # be the first hint that uv is too old to resolve a Python that imports torch.
+    if ! _uv_version_ok uv; then
+        substep "[WARN] uv is still older than $UV_MIN_VERSION -- Python $PYTHON_VERSION may resolve to a release that cannot import torch" "$C_WARN"
+    fi
 fi
 
 # ── Create venv (migrate old layout if possible, otherwise fresh) ──
@@ -2378,14 +2408,14 @@ fi
 if [ ! -x "$VENV_DIR/bin/python" ]; then
     step "venv" "creating Python ${PYTHON_VERSION} virtual environment"
     substep "$VENV_DIR"
-    if [ "$OS" = "macos" ] && [ "$_ARCH" = "arm64" ] && [ -z "$_USER_PYTHON" ]; then
-        # Apple Silicon: request an arch-explicit arm64 CPython so uv cannot
-        # reuse a cached x86_64 (Rosetta) build. torch ships no macOS x86_64
-        # wheels since 2.2.2, so an x86_64 venv makes the torch install
-        # unresolvable. The arm64 guard below is kept as a backstop for
-        # migrated / pre-existing venvs.
+    # _uv_python_spec keeps the Apple Silicon arch-explicit form, so uv cannot
+    # reuse a cached x86_64 (Rosetta) build for which no torch wheel exists,
+    # without leaking that triple onto other platforms. The arm64 guard below is
+    # kept as a backstop for migrated / pre-existing venvs. An explicit --python
+    # is passed through verbatim; the interpreter guard below still inspects it.
+    if [ -z "$_USER_PYTHON" ]; then
         run_install_cmd "create venv" uv venv "$VENV_DIR" \
-            --python "cpython-${PYTHON_VERSION}-macos-aarch64-none"
+            --python "$(_uv_python_spec "$PYTHON_VERSION")"
     else
         run_install_cmd "create venv" uv venv "$VENV_DIR" --python "$PYTHON_VERSION"
     fi
@@ -2398,28 +2428,26 @@ if [ -x "$VENV_DIR/bin/python" ]; then
     : > "$VENV_DIR/.unsloth-studio-owned" 2>/dev/null || true
 fi
 
-# Guard against two independent Apple Silicon venv problems, in order:
-#   1. uv may create the venv from a cached x86_64 (Rosetta) Python when a
-#      same-version x86_64 build is already cached (often because uv itself
-#      is an x86_64 build). That venv reports x86_64 to wheel resolvers, and
-#      PyTorch ships no macOS wheels on the CPU index for any architecture,
-#      so the torch install can never resolve. Recreate it with an
-#      arch-explicit arm64 CPython.
-#   2. Python 3.13.8 has a known torch import bug.
-# The two are independent: a venv may be x86_64 and, once recreated, still
-# land on 3.13.8. So we re-inspect the interpreter between the checks instead
-# of chaining them with elif, guaranteeing both invariants hold on whatever
-# venv we end up with. Skip both when the user explicitly chose an interpreter
-# via --python.
+_inspect_venv() {
+    "$VENV_DIR/bin/python" -c \
+        "import platform, sys; print(platform.machine(), '{}.{}.{}'.format(*sys.version_info[:3]))" \
+        2>/dev/null || echo " "
+}
+
+# Apple Silicon only: uv may create the venv from a cached x86_64 (Rosetta)
+# Python when a same-version x86_64 build is already cached (often because uv
+# itself is an x86_64 build). That venv reports x86_64 to wheel resolvers, and
+# PyTorch ships no macOS wheels on the CPU index for any architecture, so the
+# torch install can never resolve. Recreate it with an arch-explicit arm64
+# CPython. Skip when the user explicitly chose an interpreter via --python.
+#
+# The interpreter-version guard below is a separate block rather than an elif:
+# a venv can be x86_64 and, once recreated, still land on a Python that cannot
+# import torch, so both invariants must hold on whatever venv we end up with.
+# That guard re-probes for itself, so this one no longer has to.
 if [ -z "$_USER_PYTHON" ] && [ "$OS" = "macos" ] && [ "$_ARCH" = "arm64" ]; then
-    _inspect_venv() {
-        "$VENV_DIR/bin/python" -c \
-            "import platform, sys; print(platform.machine(), '{}.{}.{}'.format(*sys.version_info[:3]))" \
-            2>/dev/null || echo " "
-    }
     _info=$(_inspect_venv)
     _VENV_ARCH=${_info%% *}
-    _PY_VER=${_info##* }
     # If the interpreter could not be executed (an x86_64 venv python on a Mac
     # without Rosetta installed), the probe above yields an empty arch. Fall
     # back to reading the binary's Mach-O arch statically so the x86_64
@@ -2441,25 +2469,88 @@ if [ -z "$_USER_PYTHON" ] && [ "$OS" = "macos" ] && [ "$_ARCH" = "arm64" ]; then
         echo "  Recreating venv with native arm64 Python ${PYTHON_VERSION}..."
         rm -rf "$VENV_DIR"
         run_install_cmd "recreate venv (arm64)" uv venv "$VENV_DIR" \
-            --python "cpython-${PYTHON_VERSION}-macos-aarch64-none"
+            --python "$(_uv_python_spec "$PYTHON_VERSION")"
         if [ -x "$VENV_DIR/bin/python" ]; then
             : > "$VENV_DIR/.unsloth-studio-owned" 2>/dev/null || true
         fi
-        # Re-inspect: the recreated arm64 venv may still be 3.13.8.
-        _info=$(_inspect_venv)
-        _VENV_ARCH=${_info%% *}
-        _PY_VER=${_info##* }
     fi
+fi
 
-    if [ "$_PY_VER" = "3.13.8" ]; then
-        echo "  WARNING: Python 3.13.8 has a known torch import bug."
-        echo "  Recreating venv with Python 3.12..."
-        rm -rf "$VENV_DIR"
-        PYTHON_VERSION="3.12"
-        run_install_cmd "recreate venv" uv venv "$VENV_DIR" \
-            --python "cpython-${PYTHON_VERSION}-macos-aarch64-none"
-        if [ -x "$VENV_DIR/bin/python" ]; then
-            : > "$VENV_DIR/.unsloth-studio-owned" 2>/dev/null || true
+# Every platform: refuse to continue on an interpreter that cannot import torch.
+# CPython 3.13.8 carries gh-139783, which makes inspect.getsourcelines()
+# mis-parse a decorator followed by a comment. torch/nn/modules/rnn.py has that
+# exact shape in the @_overload_method blocks it parses at import time, so
+# `import torch` dies with an IndentationError, Studio finds no accelerator and
+# greys out Train with no explanation (#7803). 3.13.9 was expedited a week later
+# carrying only that fix, so the bad set is the tail of the 3.13 series below
+# 3.13.9. The bounds are named and compared as a range so a future bad patch is
+# a one-line change rather than another exact-string equality to bolt on.
+_PY_BAD_FLOOR="3.13.8"
+_PY_BAD_CEIL="3.13.9"
+_PY_RECOVER_PRIMARY=">=3.13.9,<3.14"
+_PY_RECOVER_FALLBACK="3.12"
+
+# $1 is the X.Y.Z from _inspect_venv. An interpreter that would not run yields an
+# empty string, which the callers above already have better signals for.
+_python_cannot_import_torch() {
+    case "$1" in
+        ''|*[!0-9.]*) return 1 ;;
+    esac
+    if ! version_ge "$1" "$_PY_BAD_FLOOR"; then
+        return 1
+    fi
+    if version_ge "$1" "$_PY_BAD_CEIL"; then
+        return 1
+    fi
+    return 0
+}
+
+if [ -x "$VENV_DIR/bin/python" ]; then
+    _info=$(_inspect_venv)
+    _PY_VER=${_info##* }
+    if _python_cannot_import_torch "$_PY_VER"; then
+        if [ -n "$_USER_PYTHON" ]; then
+            # Honour --python rather than silently overriding the one thing the
+            # user asked us to pin, but do not let the install look healthy.
+            substep "[WARN] Python $_PY_VER cannot import torch (CPython gh-139783)." "$C_WARN"
+            substep "[WARN] Re-run without --python, or with --python 3.12, for a usable install." "$C_WARN"
+        else
+            echo "  WARNING: Python $_PY_VER cannot import torch (CPython gh-139783)."
+            echo "  Recreating venv with Python ${_PY_RECOVER_PRIMARY}..."
+            rm -rf "$VENV_DIR"
+            # Each attempt sits in an `if` so set -e cannot abort before the
+            # fallback runs. Staying inside 3.13 is preferred because that is
+            # where the fix landed; 3.12 is only for a uv whose managed-Python
+            # manifest predates 3.13.9 and so cannot resolve the range at all.
+            _PY_REBUILT=false
+            if run_install_cmd "recreate venv (Python ${_PY_RECOVER_PRIMARY})" uv venv "$VENV_DIR" \
+                --python "$(_uv_python_spec "$_PY_RECOVER_PRIMARY")"; then
+                _PY_REBUILT=true
+            else
+                substep "this uv cannot provide Python 3.13.9 or newer; falling back to Python ${_PY_RECOVER_FALLBACK}"
+                if run_install_cmd "recreate venv (Python ${_PY_RECOVER_FALLBACK})" uv venv "$VENV_DIR" \
+                    --python "$(_uv_python_spec "$_PY_RECOVER_FALLBACK")"; then
+                    _PY_REBUILT=true
+                fi
+            fi
+            if [ "$_PY_REBUILT" = true ] && [ -x "$VENV_DIR/bin/python" ]; then
+                : > "$VENV_DIR/.unsloth-studio-owned" 2>/dev/null || true
+            fi
+            # Trust the interpreter, not the request: uv can satisfy a range from
+            # somewhere unexpected, and continuing on a still-broken Python would
+            # recreate the silent chat-only install this guard exists to prevent.
+            _info=$(_inspect_venv)
+            _PY_VER=${_info##* }
+            if [ "$_PY_REBUILT" != true ] || _python_cannot_import_torch "$_PY_VER"; then
+                tauri_log "ERROR" "No usable Python available for the virtual environment"
+                step "error" "could not create a venv on a Python that can import torch" "$C_ERR"
+                substep "Tried ${_PY_RECOVER_PRIMARY} and ${_PY_RECOVER_FALLBACK}."
+                substep "Upgrade uv (>= $UV_MIN_VERSION) and re-run, or pick an interpreter with --python."
+                exit 1
+            fi
+            # Keep the recorded version in step with the interpreter actually in
+            # place; the Tauri diag marker and later messages both read it.
+            PYTHON_VERSION="$_PY_VER"
         fi
     fi
 fi
@@ -4285,6 +4376,70 @@ if [ "$SKIP_TORCH" = false ] && [ "$(_torch_index_url_leaf "${TORCH_INDEX_URL:-}
     run_install_cmd "install bitsandbytes (xpu)" uv pip install --python "$_VENV_PY" \
         --no-deps "$_BNB_XPU_SPEC" || \
         substep "[WARN] could not install an XPU-capable bitsandbytes; 4-bit QLoRA may be unavailable." "$C_WARN"
+fi
+
+# ── Refuse to finish on a torch that installed but cannot be imported ──
+# Every torch probe above reads the version through `2>/dev/null || true`, so an
+# interpreter-level ImportError (a CPython patch with gh-139783, a half-written
+# wheel, an unresolved CUDA .so) is indistinguishable from "torch is absent":
+# _installed_torch_ver comes back empty, both flavor branches skip themselves,
+# and the installer prints nothing and exits 0. Studio then reports
+# CHAT_ONLY_REASON=detection_failed and greys out Train, which is how #7803
+# stayed invisible on a working 2-GPU box. Import it once for real.
+#
+# Repair once, because a truncated wheel is worth exactly one retry, then fail.
+# The non-zero exit reaches _on_install_exit, which restores the environment this
+# run moved aside, so a failed upgrade leaves the previous working install.
+#
+# Deliberately not gated on TORCH_INDEX_URL the way the flavor block above is:
+# that gate exists to identify a GPU wheel family, and reusing it here would skip
+# every path where the index is unset while torch is still expected.
+_reinstall_torch_trio() {
+    if [ -n "${TORCH_INDEX_URL:-}" ]; then
+        _install_torch_default_index \
+            --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio
+    else
+        run_install_cmd_retry "reinstall PyTorch" uv pip install --python "$_VENV_PY" \
+            "$TORCH_CONSTRAINT" "$TORCHVISION_CONSTRAINT" "$TORCHAUDIO_CONSTRAINT" \
+            --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio
+    fi
+}
+
+if [ "$SKIP_TORCH" = false ]; then
+    if "$_VENV_PY" -c "import torch" >/dev/null 2>&1; then
+        _torch_import_ok=true
+    else
+        _torch_import_ok=false
+    fi
+
+    if [ "$_torch_import_ok" = false ]; then
+        # Re-run only to capture the message: a healthy torch can still write to
+        # stderr, so the exit status above is the test and this is the diagnosis.
+        _torch_import_err=$("$_VENV_PY" -c "import torch" 2>&1 >/dev/null || true)
+        substep "[WARN] PyTorch is installed but cannot be imported:" "$C_WARN"
+        substep "[WARN]   $_torch_import_err" "$C_WARN"
+        substep "reinstalling PyTorch once before giving up..."
+        # `|| true`: the import re-probe below is the verdict, not the reinstall's
+        # exit code, and set -e must not abort before that probe runs.
+        _reinstall_torch_trio || true
+        if "$_VENV_PY" -c "import torch" >/dev/null 2>&1; then
+            _torch_import_ok=true
+        fi
+    fi
+
+    if [ "$_torch_import_ok" = false ]; then
+        _torch_py_ver=$("$_VENV_PY" -c \
+            "import sys; print('{}.{}.{}'.format(*sys.version_info[:3]))" 2>/dev/null || echo "unknown")
+        _torch_import_err=$("$_VENV_PY" -c "import torch" 2>&1 >/dev/null || true)
+        tauri_log "ERROR" "PyTorch is installed but cannot be imported"
+        step "error" "PyTorch is installed but cannot be imported" "$C_ERR"
+        substep "Python:  $_torch_py_ver"
+        substep "Error:   $_torch_import_err"
+        substep "Training and export need a working PyTorch, so this install is not usable."
+        substep "Re-run pinning a different interpreter:  ./install.sh --python 3.12"
+        substep "Or re-run with --no-torch for a GGUF-only (chat) install."
+        exit 1
+    fi
 fi
 
 # ── CI only: overlay a source checkout over the package just installed ──

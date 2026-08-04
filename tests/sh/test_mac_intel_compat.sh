@@ -568,13 +568,25 @@ fi
 echo ""
 echo "=== Apple Silicon x86_64 (Rosetta) venv rebuild ==="
 
-# Extract the real guard block from install.sh so we exercise the shipped logic
-# (comment header down to its column-0 closing fi).
+# Extract the real guard region from install.sh so we exercise the shipped logic:
+# the venv probe, the Apple Silicon arch rebuild, and the interpreter-version
+# recovery that follows it. They are separate top-level blocks (an x86_64 venv can
+# still land on a bad interpreter once recreated), so the range runs from the
+# shared probe down to just before the torch constraint block.
 _GUARD_FILE=$(mktemp)
-awk '/Guard against two independent Apple Silicon venv problems/{f=1} f{print} f&&/^fi$/{exit}' \
-    "$INSTALL_SH" > "$_GUARD_FILE"
+sed -n '/^_inspect_venv() {$/,/^# Default torch constraint/p' "$INSTALL_SH" \
+    | sed '$d' > "$_GUARD_FILE"
 
-if [ ! -s "$_GUARD_FILE" ]; then
+# The guard leans on two shipped helpers. Take the real ones rather than
+# restating their comparison and platform rules here.
+_HELPERS_FILE=$(mktemp)
+{
+    sed -n '/^version_ge()/,/^}/p' "$INSTALL_SH"
+    sed -n '/^_uv_python_spec()/,/^}/p' "$INSTALL_SH"
+} > "$_HELPERS_FILE"
+
+if [ ! -s "$_GUARD_FILE" ] || ! grep -q '_python_cannot_import_torch' "$_GUARD_FILE" \
+    || ! grep -q '_uv_python_spec()' "$_HELPERS_FILE"; then
     echo "  FAIL: could not extract Apple Silicon venv guard from install.sh"
     FAIL=$((FAIL + 1))
 else
@@ -584,7 +596,11 @@ else
     # cpython-3.12-* -> arm64 3.12.7, cpython-3.13-* -> arm64 $REBUILD_313_VERSION.
     _RUNNER=$(mktemp)
     cat > "$_RUNNER" << 'RUNNER_EOF'
-GUARD="$1"; VENV_DIR="$2"
+GUARD="$1"; HELPERS="$2"; VENV_DIR="$3"
+. "$HELPERS"
+step()      { :; }
+substep()   { :; }
+tauri_log() { :; }
 make_python() {  # dir machine version
     mkdir -p "$1/bin"
     printf '#!/usr/bin/env bash\necho "%s %s"\n' "$2" "$3" > "$1/bin/python"
@@ -597,7 +613,12 @@ run_install_cmd() {
         dir="$3"; sel=""; shift 3
         while [ $# -gt 0 ]; do [ "$1" = "--python" ] && { sel="$2"; shift; }; shift; done
         echo "$sel" >> "$RECREATE_LOG"
+        # NO_313_9 models a uv whose managed-Python manifest predates 3.13.9, the
+        # condition that put users on the broken patch in the first place.
         case "$sel" in
+            *'>=3.13.9'*)
+                [ -n "$NO_313_9" ] && return 1
+                make_python "$dir" arm64 "${RECOVER_313_VERSION:-3.13.12}" ;;
             *3.12-macos-aarch64*) make_python "$dir" arm64 "3.12.7" ;;
             *3.13-macos-aarch64*) make_python "$dir" arm64 "${REBUILD_313_VERSION:-3.13.3}" ;;
             *)                    make_python "$dir" arm64 "$sel" ;;
@@ -608,36 +629,41 @@ run_install_cmd() {
 PYTHON_VERSION="3.13"
 . "$GUARD" >&2  # guard's user-facing echoes go to stderr; keep stdout clean
 final="none"; [ -x "$VENV_DIR/bin/python" ] && final="$("$VENV_DIR/bin/python" -c x)"
-printf '%s | %s\n' "$final" "$(paste -sd, "$RECREATE_LOG" 2>/dev/null)"
+# ';' not ',': a recovery selector now carries a PEP 440 range of its own.
+printf '%s | %s\n' "$final" "$(paste -sd';' "$RECREATE_LOG" 2>/dev/null)"
 rm -f "$RECREATE_LOG"
 RUNNER_EOF
 
-    _run_guard() {  # _USER_PYTHON OS _ARCH INIT_ARCH INIT_VER REBUILD_313_VERSION
+    _run_guard() {  # _USER_PYTHON OS _ARCH INIT_ARCH INIT_VER REBUILD_313_VERSION NO_313_9
         _vd=$(mktemp -d)
         env _USER_PYTHON="$1" OS="$2" _ARCH="$3" INIT_ARCH="$4" INIT_VER="$5" \
-            REBUILD_313_VERSION="$6" bash "$_RUNNER" "$_GUARD_FILE" "$_vd/venv"
+            REBUILD_313_VERSION="$6" NO_313_9="$7" \
+            bash "$_RUNNER" "$_GUARD_FILE" "$_HELPERS_FILE" "$_vd/venv"
         rm -rf "$_vd"
     }
 
     assert_eq "clean arm64 venv left untouched" \
-        "arm64 3.13.3 | " "$(_run_guard '' macos arm64 arm64 3.13.3 '')"
+        "arm64 3.13.3 | " "$(_run_guard '' macos arm64 arm64 3.13.3 '' '')"
     assert_eq "x86_64 venv rebuilt as arm64" \
         "arm64 3.13.3 | cpython-3.13-macos-aarch64-none" \
-        "$(_run_guard '' macos arm64 x86_64 3.13.3 '')"
-    assert_eq "x86_64 venv that lands on 3.13.8 is rebuilt then downgraded to 3.12" \
-        "arm64 3.12.7 | cpython-3.13-macos-aarch64-none,cpython-3.12-macos-aarch64-none" \
-        "$(_run_guard '' macos arm64 x86_64 3.13.3 3.13.8)"
-    assert_eq "arm64 3.13.8 venv downgraded to 3.12" \
-        "arm64 3.12.7 | cpython-3.12-macos-aarch64-none" \
-        "$(_run_guard '' macos arm64 arm64 3.13.8 '')"
-    assert_eq "--python override skips the guard entirely" \
-        "x86_64 3.13.3 | " "$(_run_guard 3.11 macos arm64 x86_64 3.13.3 '')"
+        "$(_run_guard '' macos arm64 x86_64 3.13.3 '' '')"
+    assert_eq "x86_64 venv that lands on 3.13.8 is rebuilt then recovered onto 3.13.9+" \
+        "arm64 3.13.12 | cpython-3.13-macos-aarch64-none;cpython->=3.13.9,<3.14-macos-aarch64-none" \
+        "$(_run_guard '' macos arm64 x86_64 3.13.3 3.13.8 '')"
+    assert_eq "arm64 3.13.8 venv recovered onto 3.13.9+, not downgraded to 3.12" \
+        "arm64 3.13.12 | cpython->=3.13.9,<3.14-macos-aarch64-none" \
+        "$(_run_guard '' macos arm64 arm64 3.13.8 '' '')"
+    assert_eq "3.12 fallback keeps the Apple Silicon triple when uv has no 3.13.9" \
+        "arm64 3.12.7 | cpython->=3.13.9,<3.14-macos-aarch64-none;cpython-3.12-macos-aarch64-none" \
+        "$(_run_guard '' macos arm64 arm64 3.13.8 '' 1)"
+    assert_eq "--python override is honoured, never rebuilt over" \
+        "x86_64 3.13.3 | " "$(_run_guard 3.11 macos arm64 x86_64 3.13.3 '' '')"
     assert_eq "x86_64 host (Intel/Rosetta shell) is a no-op here" \
-        "x86_64 3.13.3 | " "$(_run_guard '' macos x86_64 x86_64 3.13.3 '')"
+        "x86_64 3.13.3 | " "$(_run_guard '' macos x86_64 x86_64 3.13.3 '' '')"
 
     rm -f "$_RUNNER"
 fi
-rm -f "$_GUARD_FILE"
+rm -f "$_GUARD_FILE" "$_HELPERS_FILE"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

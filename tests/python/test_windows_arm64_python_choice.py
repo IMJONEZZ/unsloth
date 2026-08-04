@@ -43,6 +43,9 @@ def _resolver_script(installed: list[tuple[str, str]], can_download: bool) -> st
     source = INSTALL_PS1.read_text(encoding = "utf-8")
     finder = _extract(r"    function Find-CompatiblePython \{.*?\n    \}\n", source)
     installer = _extract(r"    function Install-X64Python \{.*?\n    \}\n", source)
+    # The resolver screens out interpreters that cannot import torch, so its
+    # helper has to come along or every candidate is dropped by the catch.
+    screen = _extract(r"    function Test-PythonCannotImportTorch \{.*?\n    \}\n", source)
 
     names = [f"Py{minor.replace('.', '')}{arch}.exe" for minor, arch in installed]
     table = ", ".join(
@@ -101,6 +104,7 @@ function Get-PythonPlatformTag {{
 }}
 function Refresh-SessionPath {{ }}
 function Install-PythonFromPythonOrg {{ param([string]$Arch = "") return {downloaded} }}
+{screen}
 {finder}
 {installer}
 # The caller's ARM64 swap, condensed to what decides the interpreter.

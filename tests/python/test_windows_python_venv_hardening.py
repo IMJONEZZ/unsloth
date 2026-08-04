@@ -44,6 +44,9 @@ def _run_powershell(shell: str, script: str, env: dict[str, str]) -> str:
 def test_path_python_wrapper_resolves_to_real_executable(tmp_path: Path, shell: str):
     source = INSTALL_PS1.read_text(encoding = "utf-8")
     finder = _extract(r"    function Find-CompatiblePython \{.*?\n    \}\n", source)
+    # The resolver screens out interpreters that cannot import torch, so its
+    # helper has to come along or every candidate is dropped by the catch.
+    screen = _extract(r"    function Test-PythonCannotImportTorch \{.*?\n    \}\n", source)
     (tmp_path / "sitecustomize.py").write_text('print("STARTUP_BANNER")\n', encoding = "utf-8")
     if os.name == "nt":
         wrapper = tmp_path / "python.bat"
@@ -70,6 +73,7 @@ function Get-Command {{
     }}
     return @()
 }}
+{screen}
 {finder}
 $found = Find-CompatiblePython
 Write-Output $found.Path

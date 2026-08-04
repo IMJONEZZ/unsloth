@@ -1288,6 +1288,23 @@ exit 0
     # Returns @{ Version = "3.13"; Path = "C:\...\python.exe" } or $null.
     # The resolved Path is passed to `uv venv --python` to prevent uv from
     # re-resolving the version string back to a conda interpreter.
+    # CPython 3.13.8 carries gh-139783: inspect.getsourcelines() mis-parses a
+    # decorator followed by a comment, which is exactly the shape of the
+    # @_overload_method blocks torch/nn/modules/rnn.py parses at import time. The
+    # result is an IndentationError out of `import torch`, after which Studio
+    # reports no accelerator and greys out Train with no explanation (#7803).
+    # 3.13.9 was expedited a week later carrying only that fix, so the bad set is
+    # the tail of the 3.13 series below 3.13.9. Windows reaches it through an
+    # already-installed interpreter rather than uv's manifest, so the screen
+    # belongs in detection: never hand such a build to uv venv.
+    function Test-PythonCannotImportTorch {
+        param([string]$FullVersion)
+        if ([string]::IsNullOrWhiteSpace($FullVersion)) { return $false }
+        $parsed = $null
+        if (-not [version]::TryParse($FullVersion, [ref]$parsed)) { return $false }
+        return ($parsed -ge [version]"3.13.8" -and $parsed -lt [version]"3.13.9")
+    }
+
     function Find-CompatiblePython {
         # -X64Only: best installed x64 interpreter or $null, never ARM64. Last resort for
         # Install-X64Python, where x64 of a lower-priority minor beats ARM64.
@@ -1310,8 +1327,9 @@ exit 0
             foreach ($minor in $minors) {
                 try {
                     $out = & $pyLauncher.Source "-$minor" --version 2>&1 | Out-String
-                    if ($out -match "Python (3\.1[1-3])\.\d+") {
-                        $ver = $Matches[1]
+                    if ($out -match "Python ((3\.1[1-3])\.\d+)") {
+                        if (Test-PythonCannotImportTorch $Matches[1]) { continue }
+                        $ver = $Matches[2]
                         # Resolve the actual executable path and verify it is not conda-based
                         $resolvedExe = (& $pyLauncher.Source "-$minor" -S -c "import sys; print(sys.executable)" 2>$null | Out-String).Trim()
                         if ($resolvedExe -and (Test-Path -LiteralPath $resolvedExe -PathType Leaf) -and -not (Test-IsCondaPython $resolvedExe)) {
@@ -1336,8 +1354,9 @@ exit 0
                 if (Test-IsCondaPython $cmd.Source) { continue }
                 try {
                     $out = & $cmd.Source --version 2>&1 | Out-String
-                    if ($out -match "Python (3\.1[1-3])\.\d+") {
-                        $ver = $Matches[1]
+                    if ($out -match "Python ((3\.1[1-3])\.\d+)") {
+                        if (Test-PythonCannotImportTorch $Matches[1]) { continue }
+                        $ver = $Matches[2]
                         # PATH entries may be wrappers (e.g. pyenv-win's python.bat).
                         # Resolve the real executable so uv bypasses wrapper re-resolution.
                         $resolvedExe = (& $cmd.Source -S -c "import sys; print(sys.executable)" 2>$null | Out-String).Trim()
@@ -1368,8 +1387,9 @@ exit 0
                     if (Test-IsCondaPython $exe) { continue }
                     try {
                         $out = & $exe --version 2>&1 | Out-String
-                        if ($out -match "Python (3\.1[1-3])\.\d+") {
-                            $candidates += @{ Version = $Matches[1]; Path = $exe }
+                        if ($out -match "Python ((3\.1[1-3])\.\d+)") {
+                            if (Test-PythonCannotImportTorch $Matches[1]) { continue }
+                            $candidates += @{ Version = $Matches[2]; Path = $exe }
                         }
                     } catch {}
                 }
@@ -1590,7 +1610,12 @@ exit 0
 
     # ── Install uv ──
     Write-TauriLog "STEP" "Installing uv package manager"
-    $UvMinVersion = "0.8.16"
+    # Kept in step with install.sh: 0.9.3 is the first uv whose managed-Python
+    # manifest carries CPython 3.13.9, the release that fixed the gh-139783 torch
+    # import failure. Windows usually hands uv an already-detected interpreter
+    # path rather than a version, but the uv-managed path exists and the two
+    # installers are expected to agree on their floor.
+    $UvMinVersion = "0.9.3"
     function Test-UvVersionOk {
         $cmd = Get-Command uv -ErrorAction SilentlyContinue
         if (-not $cmd) { return $false }
