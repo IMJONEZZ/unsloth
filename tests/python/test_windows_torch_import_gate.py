@@ -182,9 +182,9 @@ def test_a_timed_out_probe_is_waited_out_before_the_installer_moves_on():
         "an unbounded read blocks for as long as any grandchild that inherited the "
         "handles keeps them open, which is the deadlock the async reads avoid"
     )
-    assert len(re.findall(r"Task\.Wait\(|\$(?:out|err)Task\.Wait\(\s*\d+\s*\)", branch)) == 2, (
-        "both pipes have to be drained, and with a bound"
-    )
+    assert (
+        len(re.findall(r"Task\.Wait\(|\$(?:out|err)Task\.Wait\(\s*\d+\s*\)", branch)) == 2
+    ), "both pipes have to be drained, and with a bound"
 
 
 def test_a_wedged_probe_still_returns_promptly(tmp_path):
