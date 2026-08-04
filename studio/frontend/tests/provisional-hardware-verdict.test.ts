@@ -236,9 +236,15 @@ test("a deferred verdict is recorded so the sidebar can poll out of it", async (
     /detectionDeferred: isDetectionDeferred\(data\)/,
     "the store never records that the verdict came from a deferred reply",
   );
+  // Matched as two claims joined by an elastic gap, not one literal: the guard
+  // grows a new `chatOnlyReason !== "..."` clause every time another reason
+  // becomes recoverable (detection_failed was the second), and Biome rewraps the
+  // condition across lines when it does. A literal anchor goes stale on
+  // formatting alone while the behaviour it guards is intact. The gap is bounded
+  // so dropping !detectionDeferred entirely still fails.
   assert.match(
     sidebar,
-    /chatOnlyReason !== "mlx_unavailable" && !detectionDeferred/,
+    /chatOnlyReason !== "mlx_unavailable"[\s\S]{0,240}?!detectionDeferred/,
     "the recovery poll still ignores a deferred verdict, so it never recovers",
   );
 });

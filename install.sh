@@ -2299,11 +2299,40 @@ _uv_python_spec() {
 }
 
 if ! command -v uv >/dev/null 2>&1 || ! _uv_version_ok uv; then
+    # Whether a failed refresh is fatal depends on what is already here. With no
+    # uv at all there is nothing to fall back to, so a download failure has to
+    # stop the install. With an existing but older uv it must not: raising
+    # UV_MIN_VERSION pulled every 0.8.16-0.9.2 user into this block, and those
+    # installs used to succeed without touching the network. An old uv can still
+    # create a venv, and the interpreter guard below repairs a bad Python via the
+    # 3.12 fallback, so an air-gapped box keeps working instead of being broken
+    # by a floor that only exists to *prefer* a newer interpreter.
+    _uv_present_before=false
+    command -v uv >/dev/null 2>&1 && _uv_present_before=true
+
     substep "installing uv package manager..."
-    _uv_tmp=$(mktemp)
-    download "https://astral.sh/uv/install.sh" "$_uv_tmp"
-    run_maybe_quiet sh "$_uv_tmp" </dev/null
-    rm -f "$_uv_tmp"
+    _uv_refreshed=true
+    # download() exits the shell outright when neither curl nor wget is present,
+    # which an `if` cannot catch, so probe first. Otherwise a minimal image that
+    # has uv copied in but no downloader would abort here -- an install that
+    # worked before the floor was raised.
+    if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; then
+        _uv_tmp=$(mktemp)
+        if download "https://astral.sh/uv/install.sh" "$_uv_tmp"; then
+            run_maybe_quiet sh "$_uv_tmp" </dev/null || _uv_refreshed=false
+        else
+            _uv_refreshed=false
+        fi
+        rm -f "$_uv_tmp"
+    else
+        _uv_refreshed=false
+    fi
+    if [ "$_uv_refreshed" = false ] && [ "$_uv_present_before" = false ]; then
+        tauri_log "ERROR" "Could not install uv"
+        step "error" "could not download uv, and none is installed" "$C_ERR"
+        substep "Check the network, or install uv manually: https://docs.astral.sh/uv/"
+        exit 1
+    fi
     if [ -f "$HOME/.local/bin/env" ]; then
         . "$HOME/.local/bin/env"
     fi

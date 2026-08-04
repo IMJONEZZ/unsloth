@@ -282,6 +282,90 @@ assert_contains "a stale uv after install is reported rather than silently accep
     "$(sed -n '/installing uv package manager\.\.\./,/^fi$/p' "$INSTALL_SH")" \
     'uv is still older than'
 
+# Raising the floor pulled every uv 0.8.16-0.9.2 user into the refresh path they
+# used to skip. On an air-gapped machine the download fails, and under `set -e`
+# that turned a working offline install into a hard failure. An existing-but-old
+# uv can still create a venv and the guard above still repairs a bad Python, so
+# only a machine with NO uv at all may treat this as fatal. Executed, because the
+# whole point is the exit status.
+_UVBLK=$(mktemp)
+{
+    echo 'set -e'
+    cat <<'STUBS'
+substep() { printf "SUBSTEP|%s\n" "$1"; }
+step() { printf "STEP|%s|%s\n" "$1" "$2"; }
+tauri_log() { :; }
+_is_verbose() { return 1; }
+run_maybe_quiet() { "$@" >/dev/null 2>&1; }
+PYTHON_VERSION=3.13
+STUBS
+    sed -n '/^version_ge()/,/^}/p' "$INSTALL_SH"
+    sed -n '/^_uv_version_ok()/,/^}/p' "$INSTALL_SH"
+    sed -n '/^UV_MIN_VERSION=/p' "$INSTALL_SH"
+    echo 'download() { return 1; }   # air-gapped'
+    sed -n '/^if ! command -v uv >\/dev\/null 2>&1 || ! _uv_version_ok uv; then$/,/^fi$/p' "$INSTALL_SH"
+    echo 'echo "REACHED_END"'
+} > "$_UVBLK"
+
+_OFFDIR=$(mktemp -d)
+# (a) an old-but-present uv: offline refresh must warn, not abort
+printf '#!/bin/sh\n[ "$1" = --version ] && echo "uv 0.9.2"\nexit 0\n' > "$_OFFDIR/uv"
+chmod +x "$_OFFDIR/uv"
+_off_out=$(PATH="$_OFFDIR:$PATH" HOME="$_OFFDIR" sh "$_UVBLK" 2>&1) && _off_rc=0 || _off_rc=$?
+assert_eq "offline with an existing old uv still completes (no hard failure)" "0" "$_off_rc"
+assert_contains "offline with an existing old uv reaches the rest of the install" \
+    "$_off_out" "REACHED_END"
+
+# (b) no uv at all: nothing to fall back to, so this one must be fatal
+rm -f "$_OFFDIR/uv"
+_off2_out=$(PATH="$_OFFDIR:/usr/bin:/bin" HOME="$_OFFDIR" sh "$_UVBLK" 2>&1) && _off2_rc=0 || _off2_rc=$?
+assert_eq "offline with no uv at all fails the install" "1" "$_off2_rc"
+assert_contains "offline with no uv at all explains why" \
+    "$_off2_out" "could not download uv"
+
+rm -rf "$_OFFDIR"
+rm -f "$_UVBLK"
+
+# (c) an old-but-present uv on a box with neither curl nor wget. download() exits
+# the shell outright in that case, which an `if` cannot catch, so the block has to
+# probe for a downloader before calling it. Same contract as (a): warn, continue.
+# Uses the real download() rather than the stub above, since the exit is inside it.
+_UVBLK2=$(mktemp)
+{
+    cat <<'STUBS'
+substep() { printf '  %s\n' "$1"; }
+step() { printf '  %-15s%s\n' "$1" "$2"; }
+tauri_log() { :; }
+run_maybe_quiet() { "$@"; }
+PYTHON_VERSION=3.13
+STUBS
+    sed -n '/^version_ge()/,/^}/p' "$INSTALL_SH"
+    sed -n '/^_uv_version_ok()/,/^}/p' "$INSTALL_SH"
+    sed -n '/^UV_MIN_VERSION=/p' "$INSTALL_SH"
+    sed -n '/^download()/,/^}/p' "$INSTALL_SH"
+    sed -n '/^if ! command -v uv >\/dev\/null 2>&1 || ! _uv_version_ok uv; then$/,/^fi$/p' "$INSTALL_SH"
+    echo 'echo "REACHED_END"'
+} > "$_UVBLK2"
+
+_NODLDIR=$(mktemp -d)
+printf '#!/bin/sh\n[ "$1" = --version ] && echo "uv 0.9.2"\nexit 0\n' > "$_NODLDIR/uv"
+chmod +x "$_NODLDIR/uv"
+# PATH holds only the stub dir, so neither curl nor wget is resolvable. The
+# interpreter is invoked by absolute path because that PATH cannot find sh either.
+_nodl_out=$(PATH="$_NODLDIR" HOME="$_NODLDIR" /bin/sh "$_UVBLK2" 2>&1) && _nodl_rc=0 || _nodl_rc=$?
+assert_eq "an old uv with no curl or wget still completes" "0" "$_nodl_rc"
+assert_contains "an old uv with no curl or wget reaches the rest of the install" \
+    "$_nodl_out" "REACHED_END"
+case "$_nodl_out" in
+    *"Install one and re-run"*)
+        assert_eq "no downloader must not abort via download()'s hard exit" "absent" "present" ;;
+    *)
+        assert_eq "no downloader must not abort via download()'s hard exit" "absent" "absent" ;;
+esac
+
+rm -rf "$_NODLDIR"
+rm -f "$_UVBLK2"
+
 rm -f "$_HELPERS_FILE"
 
 echo ""
