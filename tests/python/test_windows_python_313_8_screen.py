@@ -46,7 +46,7 @@ def _pwsh(script: str) -> str:
     return result.stdout.strip()
 
 
-def _resolver_script(installed: list[str]) -> str:
+def _resolver_script(installed: list[str], skip_torch: bool = False) -> str:
     """Run the shipped resolver over `installed` full versions, newest-first.
 
     Extracted rather than reimplemented so the test cannot drift from the text
@@ -71,6 +71,7 @@ def _resolver_script(installed: list[str]) -> str:
     return f"""
 $ErrorActionPreference = "Stop"
 $PythonVersion = "3.13"
+$SkipTorch = ${"true" if skip_torch else "false"}
 $script:WingetAvailable = $false
 $script:CondaSkipPattern = 'conda'
 $Interpreters = @({table})
@@ -106,11 +107,14 @@ if ($found) {{ Write-Output "$($found.Version)" }} else {{ Write-Output "none" }
 """
 
 
-def _screen_script(versions: list[str]) -> str:
+def _screen_script(versions: list[str], skip_torch: bool = False) -> str:
     source = INSTALL_PS1.read_text(encoding = "utf-8")
     screen = _extract(r"    function Test-PythonCannotImportTorch \{.*?\n    \}\n", source)
     checks = "\n".join(f'Write-Output (Test-PythonCannotImportTorch "{v}")' for v in versions)
-    return f'$ErrorActionPreference = "Stop"\n{screen}\n{checks}\n'
+    preamble = (
+        f'$ErrorActionPreference = "Stop"\n$SkipTorch = ${"true" if skip_torch else "false"}\n'
+    )
+    return f"{preamble}{screen}\n{checks}\n"
 
 
 pytestmark = pytest.mark.skipif(shutil.which("pwsh") is None, reason = "PowerShell is unavailable")
@@ -150,3 +154,30 @@ def test_screen_matches_only_the_broken_release(version, expected):
 )
 def test_resolver_skips_the_broken_interpreter(installed, expected):
     assert _pwsh(_resolver_script(installed)) == expected
+
+
+# ── --no-torch must not be screened out ──
+# install.sh gates the same screen on SKIP_TORCH because the only thing wrong
+# with 3.13.8 is `import torch`, which a GGUF-only install never runs. Windows
+# has no managed-Python fallback to absorb a rejection: Find-CompatiblePython
+# feeds `uv venv` a resolved --python, so returning $null sends the run into
+# winget, then python.org, then "Python installation failed". On an offline or
+# locked-down host that is a chat-only install broken by a constraint it never
+# reaches.
+
+
+@pytest.mark.parametrize("version", ["3.13.8", "3.13.7", "3.12.10"])
+def test_the_screen_is_inert_under_no_torch(version):
+    assert _pwsh(_screen_script([version], skip_torch = True)) == "False"
+
+
+def test_no_torch_keeps_the_only_interpreter_a_locked_down_host_has():
+    # Without the SKIP_TORCH gate this returns "none", and the caller then fails
+    # the install outright rather than building a working GGUF-only venv.
+    assert _pwsh(_resolver_script(["3.13.8"], skip_torch = True)) == "3.13"
+
+
+def test_a_torch_install_still_rejects_the_broken_interpreter():
+    # The gate must be scoped to --no-torch only; the #7803 screen is the whole
+    # point of this block for every install that does import torch.
+    assert _pwsh(_resolver_script(["3.13.8"], skip_torch = False)) == "none"

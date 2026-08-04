@@ -1297,8 +1297,19 @@ exit 0
     # the tail of the 3.13 series below 3.13.9. Windows reaches it through an
     # already-installed interpreter rather than uv's manifest, so the screen
     # belongs in detection: never hand such a build to uv venv.
+    #
+    # Not under --no-torch, matching install.sh's SKIP_TORCH gate on the same
+    # screen: the only thing wrong with these builds is `import torch`, which a
+    # no-torch install never performs (it installs no PyTorch and the import gate
+    # skips itself). Rejecting one here does not fall back to a managed Python --
+    # Windows has no such path, Find-CompatiblePython feeds `uv venv` a resolved
+    # --python -- so an offline or locked-down host whose only interpreter is
+    # 3.13.8 leaves detection empty, tries winget and python.org, and ends at
+    # "Python installation failed". That turns a GGUF-only install that used to
+    # work into a hard failure over a constraint it never reaches.
     function Test-PythonCannotImportTorch {
         param([string]$FullVersion)
+        if ($SkipTorch) { return $false }
         if ([string]::IsNullOrWhiteSpace($FullVersion)) { return $false }
         $parsed = $null
         if (-not [version]::TryParse($FullVersion, [ref]$parsed)) { return $false }
@@ -2942,17 +2953,37 @@ exit 0
     # bare torchvision/torchaudio there resolves an ABI-incompatible build.
     function Invoke-TorchTrioReinstall {
         if ($ROCmIndexUrl) {
+            # Same three-tier companion fallback as the fresh ROCm install and the
+            # flavor repair, not a two-tier one. The auto gfx115x/gfx120x reroute
+            # sets $ROCmTorchFloor from $torchFloorMap but leaves $PinnedRocm*Spec
+            # null (only an explicit index pin fills those), so stopping at the pin
+            # would drop to a bare torchvision/torchaudio on repo.amd.com -- the
+            # exact thing the floor maps exist to prevent, since AMD publishes each
+            # companion independently per arch and a bare spec resolves an
+            # ABI-incompatible build next to the floored torch.
             $rocmSpec = if ($ROCmTorchFloor) { $ROCmTorchFloor } else { "torch" }
-            $visionSpec = if ($PinnedRocmVisionSpec) { $PinnedRocmVisionSpec } else { "torchvision" }
-            $audioSpec = if ($PinnedRocmAudioSpec) { $PinnedRocmAudioSpec } else { "torchaudio" }
+            $visionSpec = if ($PinnedRocmVisionSpec) { $PinnedRocmVisionSpec } elseif ($ROCmGfxArch -and $torchvisionFloorMap -and $torchvisionFloorMap.ContainsKey($ROCmGfxArch)) { $torchvisionFloorMap[$ROCmGfxArch] } else { "torchvision" }
+            $audioSpec = if ($PinnedRocmAudioSpec) { $PinnedRocmAudioSpec } elseif ($ROCmGfxArch -and $torchaudioFloorMap -and $torchaudioFloorMap.ContainsKey($ROCmGfxArch)) { $torchaudioFloorMap[$ROCmGfxArch] } else { "torchaudio" }
             return Invoke-InstallCommandRetry -Label "reinstall PyTorch (ROCm)" -Command { uv pip install --python $VenvPython --force-reinstall --default-index $ROCmIndexUrl $rocmSpec $visionSpec $audioSpec }
         }
+        # Same win_arm64 exception the fresh install makes above (whl/cpu carries
+        # torch and torchvision for win_arm64 but no torchaudio at all). Asking for
+        # it here does not degrade to a partial repair: uv resolves the request as a
+        # unit, so the one repair this gate allows itself would fail outright and
+        # reinstall nothing, then fail the install and roll the venv back over a
+        # wheel that does not exist. The --reinstall-package flags stay as they are;
+        # naming a package outside the resolution is a no-op. ROCm is x64-only on
+        # Windows (repo.amd.com publishes no win_arm64), so that branch is unchanged.
+        $_repairSpecs = @("torch>=2.4,<2.11.0", "torchvision>=0.19,<0.26.0")
+        if ((Get-VenvPlatformTag -PythonExe $VenvPython) -ne "win-arm64") {
+            $_repairSpecs += "torchaudio>=2.4,<2.11.0"
+        }
         if ($TorchIndexUrl) {
-            return Invoke-InstallCommandRetry -Label "reinstall PyTorch" -Command { uv pip install --python $VenvPython "torch>=2.4,<2.11.0" "torchvision>=0.19,<0.26.0" "torchaudio>=2.4,<2.11.0" --default-index $TorchIndexUrl --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio }
+            return Invoke-InstallCommandRetry -Label "reinstall PyTorch" -Command { uv pip install --python $VenvPython @_repairSpecs --default-index $TorchIndexUrl --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio }
         }
         # No index resolved. Still repairable: a plain resolve is what a CPU-only
         # host would have installed in the first place.
-        return Invoke-InstallCommandRetry -Label "reinstall PyTorch" -Command { uv pip install --python $VenvPython "torch>=2.4,<2.11.0" "torchvision>=0.19,<0.26.0" "torchaudio>=2.4,<2.11.0" --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio }
+        return Invoke-InstallCommandRetry -Label "reinstall PyTorch" -Command { uv pip install --python $VenvPython @_repairSpecs --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio }
     }
 
     # An explicit pin is authoritative: the AMD ROCm reroute below must not rewrite it

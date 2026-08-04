@@ -301,9 +301,23 @@ def test_a_slow_first_probe_that_then_succeeds_still_finishes():
 # ── The reinstall helper picks the index this run already resolved ──
 
 
-def _reinstall_script(*, rocm_index: str, torch_index: str) -> str:
+def _reinstall_script(
+    *,
+    rocm_index: str,
+    torch_index: str,
+    venv_platform: str = "win-amd64",
+    gfx_arch: str = "",
+    pinned_vision: str | None = "torchvision>=0.26.0,<0.27.0",
+    pinned_audio: str | None = None,
+) -> str:
     # See _probe_script: kept out of the f-string for pre-3.12 compatibility.
     helper = _extract(r"    function Invoke-TorchTrioReinstall \{.*?\n    \}\n")
+    # The shipped floor maps, not copies: the repair has to agree with the fresh
+    # install about which companion range each arch needs.
+    vision_map = _extract(r"        \$torchvisionFloorMap = @\{.*?\n        \}\n")
+    audio_map = _extract(r"        \$torchaudioFloorMap = @\{.*?\n        \}\n")
+    vision_lit = f"'{pinned_vision}'" if pinned_vision else "$null"
+    audio_lit = f"'{pinned_audio}'" if pinned_audio else "$null"
     return f"""
 $script:Captured = ''
 # Invoke the scriptblock rather than reading its source: ToString() returns the
@@ -319,12 +333,16 @@ function Invoke-InstallCommandRetry {{
     & $Command
     return 0
 }}
+function Get-VenvPlatformTag {{ param([string]$PythonExe) return '{venv_platform}' }}
 $VenvPython = '/venv/python'
 $ROCmIndexUrl = '{rocm_index}'
 $TorchIndexUrl = '{torch_index}'
 $ROCmTorchFloor = 'torch>=2.9'
-$PinnedRocmVisionSpec = 'torchvision>=0.26.0,<0.27.0'
-$PinnedRocmAudioSpec = $null
+$ROCmGfxArch = '{gfx_arch}'
+{vision_map}
+{audio_map}
+$PinnedRocmVisionSpec = {vision_lit}
+$PinnedRocmAudioSpec = {audio_lit}
 
 {helper}
 
@@ -341,9 +359,62 @@ def test_reinstall_prefers_the_rocm_index_with_pinned_companions():
     )
     assert "reinstall PyTorch (ROCm)" in out
     assert "repo.amd.com/rocm/whl/gfx1151" in out
-    assert "torchvision>=0.26.0,<0.27.0" in out, (
-        "a bare companion resolves an ABI-incompatible build"
+    assert (
+        "torchvision>=0.26.0,<0.27.0" in out
+    ), "a bare companion resolves an ABI-incompatible build"
+
+
+# ── The auto ROCm reroute sets a torch floor but no companion pins ──
+# $PinnedRocmVisionSpec / $PinnedRocmAudioSpec are only filled by an explicit
+# index pin. The gfx115x/gfx120x auto-route sets $ROCmTorchFloor from
+# $torchFloorMap and leaves both null, so a two-tier fallback lands on a bare
+# torchvision/torchaudio against repo.amd.com. AMD's ROCm torchvision wheels
+# declare a bare "Requires-Dist: torch", so the resolver offers no protection of
+# its own, which is why the fresh install and the flavor repair both consult the
+# floor maps. The repair must do the same or it pairs an unbounded companion with
+# the floored torch it just pinned.
+
+
+def test_the_rocm_repair_falls_back_to_the_floor_maps_when_no_pin_was_set():
+    out = _pwsh(
+        _reinstall_script(
+            rocm_index = "https://repo.amd.com/rocm/whl/gfx1151",
+            torch_index = "",
+            gfx_arch = "gfx1151",
+            pinned_vision = None,
+            pinned_audio = None,
+        )
     )
+    assert "reinstall PyTorch (ROCm)" in out
+    assert "torchvision>=0.26.0,<0.27.0" in out, "the auto route must not ship a bare companion"
+    assert "torchaudio>=2.11.0,<2.12.0" in out, "the auto route must not ship a bare companion"
+
+
+def test_an_explicit_pin_still_wins_over_the_floor_map():
+    out = _pwsh(
+        _reinstall_script(
+            rocm_index = "https://repo.amd.com/rocm/whl/gfx1151",
+            torch_index = "",
+            gfx_arch = "gfx1151",
+            pinned_vision = "torchvision>=0.99",
+            pinned_audio = "torchaudio>=9.9",
+        )
+    )
+    assert "torchvision>=0.99" in out and "torchaudio>=9.9" in out
+
+
+def test_an_arch_outside_the_floor_maps_still_degrades_to_bare_companions():
+    # Older/unlisted gfx arches publish <2.11 and are meant to stay unpinned.
+    out = _pwsh(
+        _reinstall_script(
+            rocm_index = "https://repo.amd.com/rocm/whl/gfx90a",
+            torch_index = "",
+            gfx_arch = "gfx90a",
+            pinned_vision = None,
+            pinned_audio = None,
+        )
+    )
+    assert "torchvision>=" not in out and "torchaudio>=" not in out
 
 
 def test_reinstall_uses_the_resolved_cuda_index_when_there_is_no_rocm_one():
@@ -361,3 +432,45 @@ def test_reinstall_still_works_when_no_index_was_resolved():
     assert "reinstall PyTorch" in out
     assert "--default-index" not in out
     assert "--reinstall-package torch" in out
+
+
+# ── Windows on ARM has no torchaudio wheel, so the repair must not ask for one ──
+# download.pytorch.org/whl/cpu publishes win_arm64 builds of torch (21) and
+# torchvision (30) but none of torchaudio (0). uv resolves the request as a unit,
+# so leaving the pin in makes the one repair this gate allows itself fail
+# outright and reinstall nothing -- the install then fails and rolls back over a
+# wheel that was never going to exist. The repo already has
+# tests/studio/test_xpu_arm64_torchaudio.ps1 for this same drift between a fresh
+# install path and its repair twin.
+
+
+@pytest.mark.parametrize("torch_index", ["https://download.pytorch.org/whl/cpu", ""])
+def test_the_repair_drops_torchaudio_on_win_arm64(torch_index):
+    out = _pwsh(
+        _reinstall_script(rocm_index = "", torch_index = torch_index, venv_platform = "win-arm64")
+    )
+    assert "torchaudio>=" not in out, "upstream publishes no win_arm64 torchaudio wheel"
+    assert "torch>=2.4,<2.11.0" in out, "torch itself does ship win_arm64 and must be repaired"
+    assert "torchvision>=0.19,<0.26.0" in out, "torchvision ships win_arm64 too"
+
+
+@pytest.mark.parametrize("torch_index", ["https://download.pytorch.org/whl/cpu", ""])
+def test_the_repair_keeps_torchaudio_everywhere_else(torch_index):
+    out = _pwsh(
+        _reinstall_script(rocm_index = "", torch_index = torch_index, venv_platform = "win-amd64")
+    )
+    assert "torchaudio>=2.4,<2.11.0" in out, "x64 must still get the bounded companion pin"
+
+
+def test_the_rocm_repair_is_untouched_by_the_arm_exception():
+    # repo.amd.com publishes no win_arm64 wheels at all, so ROCm keeps its own
+    # pinned companions rather than inheriting the arm64 spec list.
+    out = _pwsh(
+        _reinstall_script(
+            rocm_index = "https://repo.amd.com/rocm/whl/gfx1151",
+            torch_index = "https://x/cu128",
+            venv_platform = "win-arm64",
+        )
+    )
+    assert "reinstall PyTorch (ROCm)" in out
+    assert "torchaudio" in out, "the ROCm branch still pins its own companion trio"
