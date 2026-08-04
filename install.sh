@@ -4591,6 +4591,16 @@ _torch_import_probe() {
     _torch_probe_run >/dev/null 2>&1
 }
 
+# Only two statuses mean "no verdict": 1 from faulthandler's watchdog, which
+# _exit(1)s after dumping, and 124 from timeout(1). Everything else -- 3 for a
+# caught import error, 139/134 for a SIGSEGV/SIGABRT inside a CUDA or ROCm
+# library, 127 for an interpreter that will not start -- is the probe telling us
+# torch is broken. Treating those as timeouts would warn and commit the venv,
+# which is the silent success this whole gate exists to stop.
+_torch_probe_timed_out() {
+    [ "$1" = "1" ] || [ "$1" = "124" ]
+}
+
 # The failure text, collected under the same bounds and the same library path.
 _torch_import_error() {
     _torch_probe_run 2>&1 >/dev/null || true
@@ -4613,12 +4623,18 @@ _torch_import_gate() {
     _torch_import_probe || _torch_probe_rc=$?
     if [ "$_torch_probe_rc" = 0 ]; then
         _torch_import_ok=true
-    elif [ "$_torch_probe_rc" != 3 ]; then
+    elif _torch_probe_timed_out "$_torch_probe_rc"; then
         _torch_import_timed_out=true
     fi
 
-    if [ "$_torch_import_ok" = false ] && [ "$_torch_import_timed_out" = false ] &&
-        [ "$_TORCH_REPAIR_DONE" = false ]; then
+    # Repair only on the authoritative pass. Before studio setup the runtime
+    # libraries torch links against may not be installed yet, and reinstalling
+    # the trio cannot supply them: on a fresh Windows host the advisory pass
+    # would burn the run's single repair -- a full refresh of every wheel, since
+    # --reinstall-package implies --refresh-package -- on a WinError 126 that
+    # Ensure-VCRedist is about to fix for free.
+    if [ "$1" = "final" ] && [ "$_torch_import_ok" = false ] &&
+        [ "$_torch_import_timed_out" = false ] && [ "$_TORCH_REPAIR_DONE" = false ]; then
         # Re-run only to capture the message: a healthy torch can still write to
         # stderr, so the exit status above is the test and this is the diagnosis.
         _torch_import_err=$(_torch_import_error)
@@ -4641,7 +4657,7 @@ _torch_import_gate() {
         _torch_import_probe || _torch_probe_rc=$?
         if [ "$_torch_probe_rc" = 0 ]; then
             _torch_import_ok=true
-        elif [ "$_torch_probe_rc" != 3 ]; then
+        elif _torch_probe_timed_out "$_torch_probe_rc"; then
             _torch_import_timed_out=true
         fi
     fi

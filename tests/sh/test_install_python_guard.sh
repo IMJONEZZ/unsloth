@@ -274,6 +274,11 @@ case "$2" in
         # watchdog is a native thread, so it fires on time even though the import
         # is stuck in C holding the GIL, and _exit(1)s. Without it -- the macOS
         # case, where timeout(1) does not exist either -- nothing bounds this.
+        # A native crash inside a CUDA/ROCm library exits 139/134, not 3.
+        if [ -n "${PROBE_RC:-}" ] && [ -n "$_probe" ]; then
+            printf 'simulated exit %s\n' "$PROBE_RC" >&2
+            exit "$PROBE_RC"
+        fi
         if [ -n "$TORCH_WEDGE" ]; then
             if [ -n "$_probe" ] && [ -n "$_deadline" ] && [ "$_deadline" -gt 0 ]; then
                 sleep "$_deadline"; exit 1
@@ -466,6 +471,52 @@ GATE_RUNNER_EOF
             assert_eq "the advisory pass does not declare the install unusable" "absent" "absent" ;;
     esac
     rm -f "$_GATE_OUT_FILE"
+
+    # Only the watchdog's 1 and timeout(1)'s 124 mean "the probe never reported".
+    # A SIGSEGV or SIGABRT in a CUDA/ROCm library exits 139 or 134, and an
+    # interpreter that will not start exits 127: those are the probe saying torch
+    # is broken, and warning-and-continuing on them would commit a venv whose
+    # torch demonstrably crashed -- the silent success this gate exists to stop.
+    _run_gate_rc() {  # exit status the probe should report
+        _bin=$(mktemp); _marker=$(mktemp); rm -f "$_marker"; : > "$_GATE_CALLS"
+        set +e
+        env SKIP_TORCH=false TORCH_INDEX_URL="https://download.pytorch.org/whl/cu128" \
+            REPAIR_WORKS="" TORCH_OK_MARKER="$_marker" CALL_LOG="$_GATE_CALLS" \
+            FAKE_PY_VER="3.13.12" PROBE_RC="$1" UNSLOTH_TORCH_IMPORT_TIMEOUT=2 \
+            bash "$_GATE_RUNNER" "$_GATE_FILE" "$_bin" > /dev/null 2>&1
+        _rc=$?
+        set -e
+        rm -f "$_bin" "$_marker"
+        return $_rc
+    }
+    for _rc_case in 1 124; do
+        _run_gate_rc "$_rc_case" && _rc=0 || _rc=$?
+        assert_eq "probe exit $_rc_case is a timeout, so the install continues" "0" "$_rc"
+        assert_eq "probe exit $_rc_case attempts no repair" "" "$(cat "$_GATE_CALLS")"
+    done
+    for _rc_case in 134 139 127; do
+        _run_gate_rc "$_rc_case" && _rc=0 || _rc=$?
+        assert_eq "probe exit $_rc_case is a broken torch, so the install fails" "1" "$_rc"
+        assert_eq "probe exit $_rc_case repairs once first" \
+            "1" "$(grep -c 'repair-' "$_GATE_CALLS")"
+    done
+
+    # The advisory pass diagnoses but must not repair: before studio setup the
+    # runtime libraries torch links against may not exist yet, and a reinstall
+    # cannot supply them. It would only spend the run's single repair -- and a
+    # full wheel refresh with it, since --reinstall-package implies
+    # --refresh-package -- on a fault Ensure-VCRedist is about to fix for free.
+    _bin=$(mktemp); _marker=$(mktemp); rm -f "$_marker"; : > "$_GATE_CALLS"
+    set +e
+    env SKIP_TORCH=false TORCH_INDEX_URL="https://download.pytorch.org/whl/cu128" \
+        REPAIR_WORKS="" TORCH_OK_MARKER="$_marker" CALL_LOG="$_GATE_CALLS" \
+        FAKE_PY_VER="3.13.12" GATE_MODE=advisory UNSLOTH_TORCH_IMPORT_TIMEOUT=2 \
+        bash "$_GATE_RUNNER" "$_GATE_FILE" "$_bin" > /dev/null 2>&1
+    _rc=$?
+    set -e
+    rm -f "$_bin" "$_marker"
+    assert_eq "the advisory pass does not fail the install" "0" "$_rc"
+    assert_eq "the advisory pass does not spend the repair" "" "$(cat "$_GATE_CALLS")"
 
     _GATE_OUT_FILE=$(mktemp)
     _run_gate_wedged && _rc=0 || _rc=$?

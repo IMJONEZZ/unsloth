@@ -20,6 +20,13 @@ function Install-UnslothStudio {
     $ErrorActionPreference = "Stop"
     $script:UnslothVerbose = ($env:UNSLOTH_VERBOSE -eq "1")
 
+    # Per installer run, not per PowerShell scope. The documented
+    # `irm ... | iex` flow can call this twice in one session, and a sentinel
+    # left $true by the first run would skip the second run's only repair and
+    # roll back a torch that a retry could have fixed. install.sh gets this for
+    # free from a top-level assignment; here it has to be explicit.
+    $script:TorchRepairDone = $false
+
     # Same fix as studio/setup.ps1, for the same reason. This script also calls
     # Expand-Archive and Get-ExecutionPolicy, which resolve via PSModulePath.
     # The desktop app reaches here as Tauri -> Rust -> powershell.exe
@@ -1776,7 +1783,15 @@ exit 0
         # winget unavailable or it didn't put uv on PATH: install the pinned
         # release directly (ARM64 runners, machines without the Store).
         if (-not (Test-UvVersionOk)) {
-            Install-UvFromRelease | Out-Null
+            # $ErrorActionPreference is "Stop" here, and Install-UvFromRelease
+            # only guards its own download loop: an unwritable UV_INSTALL_DIR or
+            # an antivirus lock on uv.exe throws during extract or copy and
+            # would abort the script outright -- past the $UvPresentBefore
+            # fallback below, whose entire purpose is to keep a host that was
+            # installing fine before the floor moved.
+            try { Install-UvFromRelease | Out-Null } catch {
+                substep "could not install the pinned uv release: $($_.Exception.Message)" "Yellow"
+            }
             Refresh-SessionPath
         }
     }
@@ -2974,9 +2989,18 @@ exit 0
         # wheel that does not exist. The --reinstall-package flags stay as they are;
         # naming a package outside the resolution is a no-op. ROCm is x64-only on
         # Windows (repo.amd.com publishes no win_arm64), so that branch is unchanged.
-        $_repairSpecs = @("torch>=2.4,<2.11.0", "torchvision>=0.19,<0.26.0")
-        if ((Get-VenvPlatformTag -PythonExe $VenvPython) -ne "win-arm64") {
-            $_repairSpecs += "torchaudio>=2.4,<2.11.0"
+        # XPU keeps its own floor. unsloth/models/_utils.py rejects XPU torch
+        # below 2.6, so a generic ">=2.4" can resolve a 2.5 wheel off an XPU
+        # mirror that imports cleanly, passes this gate, and then fails the
+        # moment Unsloth initializes the device. The fresh install and the
+        # flavor repair both use Get-XpuTorchSpecs for exactly this reason.
+        if ($TorchIndexUrl -and (Get-TorchIndexLeafName $TorchIndexUrl) -eq "xpu") {
+            $_repairSpecs = Get-XpuTorchSpecs -Platform (Get-VenvPlatformTag -PythonExe $VenvPython)
+        } else {
+            $_repairSpecs = @("torch>=2.4,<2.11.0", "torchvision>=0.19,<0.26.0")
+            if ((Get-VenvPlatformTag -PythonExe $VenvPython) -ne "win-arm64") {
+                $_repairSpecs += "torchaudio>=2.4,<2.11.0"
+            }
         }
         if ($TorchIndexUrl) {
             return Invoke-InstallCommandRetry -Label "reinstall PyTorch" -Command { uv pip install --python $VenvPython @_repairSpecs --default-index $TorchIndexUrl --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio }
@@ -3478,7 +3502,14 @@ exit 0
         $script:TorchGateFailure = $null
         if ($SkipTorch) { return }
         $torchImport = Test-TorchImport -PythonExe $VenvPython
-        if (-not $torchImport.Ok -and -not $torchImport.TimedOut -and -not $script:TorchRepairDone) {
+        # Repair only on the authoritative pass. Before studio setup the Visual
+        # C++ runtime torch links against may not be installed yet, and
+        # reinstalling the trio cannot supply it: on a fresh Windows host the
+        # advisory pass would burn the run's single repair -- a full refresh of
+        # every wheel, since --reinstall-package implies --refresh-package -- on
+        # a WinError 126 that Ensure-VCRedist is about to fix for free.
+        if ($Final -and -not $torchImport.Ok -and -not $torchImport.TimedOut `
+                -and -not $script:TorchRepairDone) {
             substep "[WARN] PyTorch is installed but cannot be imported:" "Yellow"
             substep "[WARN]   $($torchImport.Error)" "Yellow"
             substep "reinstalling PyTorch once before giving up..."

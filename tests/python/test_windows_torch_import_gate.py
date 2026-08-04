@@ -295,12 +295,30 @@ def test_healthy_torch_attempts_no_repair():
 
 
 def test_one_repair_is_attempted_and_can_rescue_the_install():
-    out = _run_gate(skip_torch = False, probe_results = [False, True])
+    # Three outcomes because the repair now lives on the authoritative pass:
+    # advisory probes and reports, the post-setup pass probes again, repairs,
+    # and re-probes. Two Falses are needed to reach the repair at all.
+    out = _run_gate(skip_torch = False, probe_results = [False, False, True])
     assert "REPAIRS=1" in out
-    # Broken, repaired, re-probed in the advisory pass, then confirmed once more
-    # after setup. The repair latch is what keeps that second pass from redoing it.
     assert "PROBES=3" in out
     assert "EXIT_FAILURE" not in out, "a repaired torch must not fail the install"
+    assert "REACHED_END" in out
+
+
+def test_studio_setup_fixing_torch_costs_no_repair_at_all():
+    """The fresh-Windows case: broken before setup, fine after it.
+
+    A missing Visual C++ runtime makes `import torch` fail with WinError 126
+    until studio/setup.ps1's Ensure-VCRedist installs it. Reinstalling the trio
+    cannot supply a system runtime, so the advisory pass must not spend the
+    run's one repair -- nor the full wheel refresh that comes with it, since
+    --reinstall-package implies --refresh-package -- on a fault the next step
+    fixes for free.
+    """
+    out = _run_gate(skip_torch = False, probe_results = [False, True])
+    assert "REPAIRS=0" in out, "the advisory pass must not repair"
+    assert "PROBES=2" in out, "one probe per pass and nothing more"
+    assert "EXIT_FAILURE" not in out
     assert "REACHED_END" in out
 
 
@@ -358,7 +376,11 @@ def test_a_timeout_says_so_instead_of_blaming_the_wheel():
 
 def test_a_slow_first_probe_that_then_succeeds_still_finishes():
     """A timeout on probe 1 short-circuits, so a real ImportError still needs probe 2."""
-    out = _run_gate(skip_torch = False, probe_results = [False, True], probe_timeouts = [False, False])
+    out = _run_gate(
+        skip_torch = False,
+        probe_results = [False, False, True],
+        probe_timeouts = [False, False, False],
+    )
     assert "PROBES=3" in out and "REPAIRS=1" in out
     assert "EXIT_FAILURE" not in out
 
@@ -381,6 +403,11 @@ def _reinstall_script(
     # install about which companion range each arch needs.
     vision_map = _extract(r"        \$torchvisionFloorMap = @\{.*?\n        \}\n")
     audio_map = _extract(r"        \$torchaudioFloorMap = @\{.*?\n        \}\n")
+    # The repair picks the XPU spec list off the resolved index leaf, so both
+    # helpers it consults come from install.ps1 too. Stubbing them would let the
+    # XPU floor drift without a test noticing, which is the bug being covered.
+    xpu_specs = _extract(r"    function Get-XpuTorchSpecs \{.*?\n    \}\n")
+    leaf_name = _extract(r"    function Get-TorchIndexLeafName \{.*?\n    \}\n")
     vision_lit = f"'{pinned_vision}'" if pinned_vision else "$null"
     audio_lit = f"'{pinned_audio}'" if pinned_audio else "$null"
     return f"""
@@ -408,6 +435,8 @@ $ROCmGfxArch = '{gfx_arch}'
 {audio_map}
 $PinnedRocmVisionSpec = {vision_lit}
 $PinnedRocmAudioSpec = {audio_lit}
+{xpu_specs}
+{leaf_name}
 
 {helper}
 
@@ -424,9 +453,9 @@ def test_reinstall_prefers_the_rocm_index_with_pinned_companions():
     )
     assert "reinstall PyTorch (ROCm)" in out
     assert "repo.amd.com/rocm/whl/gfx1151" in out
-    assert (
-        "torchvision>=0.26.0,<0.27.0" in out
-    ), "a bare companion resolves an ABI-incompatible build"
+    assert "torchvision>=0.26.0,<0.27.0" in out, (
+        "a bare companion resolves an ABI-incompatible build"
+    )
 
 
 # ── The auto ROCm reroute sets a torch floor but no companion pins ──
@@ -600,9 +629,9 @@ def test_the_gate_reports_through_a_script_scoped_sentinel_not_its_return_value(
         source.count("if ($null -ne $script:TorchGateFailure) { return $script:TorchGateFailure }")
         == 2
     )
-    assert (
-        "= Invoke-TorchImportGate" not in source
-    ), "the gate's verdict must not be read from its return value"
+    assert "= Invoke-TorchImportGate" not in source, (
+        "the gate's verdict must not be read from its return value"
+    )
 
 
 def test_the_advisory_pass_cannot_fail_the_install():
